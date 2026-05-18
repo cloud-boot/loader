@@ -1,0 +1,20 @@
+{
+    "llvm-target": "aarch64-pc-windows-gnu",
+    "cpu":         "generic",
+    "features":    "",
+    "build-tags":  ["uefi", "tinygo.uefi"],
+    "goos":        "windows",
+    "goarch":      "arm64",
+    "linker":      "ld.lld",
+    "rtlib":       "compiler-rt",
+    "libc":        "",
+    "gc":          "leaking",
+    "scheduler":   "none",
+    "default-stack-size": 32768,
+    "cflags": [
+        "-ffreestanding"
+    ],
+    "_comment_llvm_triple": "aarch64-pc-windows-gnu is the analogue of x86_64-pc-windows-gnu: Clang defines __MINGW32__ so compiler-rt builds, and the object format is COFF/PE which is what UEFI wants. The Microsoft x64 vs SysV split that complicates the x86_64 thunk does not exist on aarch64 — there is exactly one calling convention (AAPCS64) shared by Windows and Linux ABIs, so the thunks just need to slide arg registers.",
+    "_comment_no_red_zone": "No `-mno-red-zone` here — the red zone is an amd64-only concept (the System V x86_64 ABI reserves 128 bytes below RSP for leaf functions). AArch64 has no equivalent.",
+    "_comment_no_soft_float": "No soft-float either: NEON / FP is mandatory in ARMv8-A baseline and the firmware leaves it usable. (Unlike x86_64 where we disable SSE because some firmware does not save XMM registers across calls before ExitBootServices.)"
+}

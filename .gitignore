@@ -1,0 +1,20 @@
+# TinyGo + lld-link build artefacts, ESP staging, and OVMF nvram snapshots.
+
+# Compiled object files (TinyGo + clang).
+*.o
+
+# Linked EFI binaries (BOOTAA64.EFI / BOOTX64.EFI variants).
+*.EFI
+
+# Linker map and ESP images produced by the qemu-probe-* tasks.
+*.map
+esp.img
+esp-stub.img
+esp-*/
+
+# OVMF non-volatile variable store snapshot.
+ovmf_vars*.fd
+nvram.bin
+
+# Taskfile run-state.
+.task/

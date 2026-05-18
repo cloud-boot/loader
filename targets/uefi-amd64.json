@@ -1,0 +1,21 @@
+{
+    "llvm-target": "x86_64-pc-windows-gnu",
+    "cpu":         "x86-64",
+    "features":    "+soft-float,-mmx,-sse,-sse2",
+    "build-tags":  ["uefi", "tinygo.uefi"],
+    "goos":        "windows",
+    "goarch":      "amd64",
+    "linker":      "ld.lld",
+    "rtlib":       "compiler-rt",
+    "libc":        "",
+    "gc":          "leaking",
+    "scheduler":   "none",
+    "default-stack-size": 32768,
+    "cflags": [
+        "-fshort-wchar",
+        "-mno-red-zone",
+        "-ffreestanding"
+    ],
+    "_comment_llvm_triple":  "x86_64-unknown-uefi is rejected by compiler-rt's int_lib.h (neither __ELF__ nor __MINGW32__ nor _WIN32 is defined for it). x86_64-pc-windows-gnu makes Clang define __MINGW32__, compiler-rt is happy, and the output format is still PE/COFF, which is what we want for UEFI. We set the EFI subsystem in the linker step.",
+    "_comment_linker":       "TinyGo only knows the ELF flavor of lld (ld.lld). We use it to produce the relocatable .o; the final PE32+ EFI binary is built by an external lld-link invocation (see Taskfile)."
+}
