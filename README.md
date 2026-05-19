@@ -31,7 +31,9 @@ non-Linux EFI image works the same way.
 | 3 | Dynamic `EFI_LOAD_FILE2_PROTOCOL` initrd from fetched bytes; cmdline propagation from plan | — |
 | 4 | DNS-SRV via `EFI_DNS4_PROTOCOL`; multi-endpoint failover; minimal cosign | — |
 | 5a | Disk-mode minimal: SFS walk, open `\EFI\Linux\cloud-boot.efi`, `LoadImage` + `StartImage` | done — see [Phase 5a result](#phase-5a-result) |
-| 5b | Disk-mode + cmdline propagation, multiple candidate UKIs, fallback order | — |
+| 5b | Cmdline propagation: EFI variable (`CloudBootCmdline`) primary, `\cmdline` file fallback; `loaded-image->load_options` patched on the child | done — see [Phase 5b result](#phase-5b-result) |
+| 5c | Multiple candidate UKIs, fallback order, `CloudBootTarget` selector | — |
+| 5d | Chain a real Linux EFI-stub kernel (vmlinuz.efi) and confirm cmdline reaches userspace | — |
 
 ## Phase 0 result
 
@@ -136,6 +138,89 @@ is to substitute a Linux EFI-stub kernel (the existing `uki/`
 pipeline output) for the cloud-boot.efi slot, propagate
 `/etc/kernel/cmdline` into the child's `loaded-image->load_options`,
 and add a fallback order across multiple candidate UKIs.
+
+## Phase 5b result
+
+Cmdline now flows from the host into the chain-loaded kernel through
+a UEFI variable, bypassing the FAT-volume rebuild that the earlier
+disk-only path required.
+
+End-to-end pipeline:
+
+1. **Host stage**: `loader/cmd/efivar-stage` writes a
+   `CloudBootCmdline` variable under the cloud-boot vendor GUID
+   (`c10ddb07-83c5-4d3e-9b76-1f4c0e7a3b8e`) directly into the OVMF
+   varstore *before* QEMU starts, using the host-side
+   `github.com/go-filesystems/uefi` package.
+2. **Loader read**: at boot the disk-mode loader's
+   `readCmdlineEFIVar` calls `RuntimeServices.GetVariable` with the
+   two-pass `EFI_BUFFER_TOO_SMALL` idiom, allocates pool memory, and
+   widens the ASCII bytes to UTF-16LE.
+3. **Disk fallback**: if no variable was staged, `readCmdline` reads
+   `\cmdline` from the FAT root instead (arch-agnostic).
+4. **Patch child**: after `LoadImage` returns the child handle, the
+   loader calls `HandleProtocol(child, LoadedImage)` and patches the
+   `LoadOptions` / `LoadOptionsSize` slots in-place, so the chain-
+   loaded EFI app's stub reads the right cmdline.
+5. **Chain**: `StartImage` transfers control to the child. The
+   `efi-probe` test target reads its own `LoadedImage.LoadOptions`
+   back to close the loop on the serial console.
+
+Verified transcript under QEMU + Homebrew OVMF arm64
+(edk2-stable202408):
+
+```text
+cloud-boot/loader — disk-mode (phase 5b)
+  cmdline from EFI var CloudBootCmdline (0x2F chars): cloud-boot: hello from CloudBootCmdline EFI var
+cmdline source: EFI variable
+  found UKI, size = 0x2400
+  LoadImage OK, child handle = 0x7F000A18
+  patched child LoadOptions (0x60 bytes)
+StartImage...
+cloud-boot/loader probe — phase 0
+  LoadOptionsSize = 0x60
+  LoadOptions = cloud-boot: hello from CloudBootCmdline EFI var
+```
+
+### Mock package fixes
+
+Getting this working surfaced four real bugs in the host-side
+[`github.com/go-filesystems/uefi`](../../mock/pkg/go-filesystems/uefi)
+package (which `efivar-stage` uses to write the varstore). All four
+fixes landed in the mock repo alongside Phase 5b:
+
+1. **GUID byte order** — `gEfiSystemNvDataFvGuid` constant had the
+   four `Data1` bytes reversed. The canonical text form is
+   `FFF12B8D-7696-4C8B-A985-2747075B4F50` (not `8D2BF1FF-…`); on-disk
+   bytes encode as `8d 2b f1 ff 96 76 8b 4c a9 85 27 47 07 5b 4f 50`.
+2. **Wrong format** — the legacy `Format()` produces a *raw* NvVar
+   store at offset 0 with the `gEfiVariableGuid` (non-auth)
+   signature. Real OVMF prebuilts (both x86_64 `edk2-i386-vars.fd`
+   and arm64 `edk2-aarch64-code.fd`'s NvVar region) expect an
+   `EFI_FIRMWARE_VOLUME` wrapper followed by an
+   `gEfiAuthenticatedVariableGuid` store. New `FormatOVMF(path,
+   size, flavor)` writes the FV-wrapped + auth layout that OVMF
+   actually accepts. `OVMFAArch64` uses ArmVirtPkg's hardcoded
+   geometry (`FvLength=0xC0000`, store size = `0x40000 − 72`); the
+   block-map covers the entire pflash slot regardless.
+3. **Auth variable header support** — `parseOneVariable` /
+   `encodeVariable` learned to handle the 60-byte
+   `AUTHENTICATED_VARIABLE_HEADER` layout (MonotonicCount, TimeStamp,
+   PubKeyIndex all zero-filled between Attributes and NameSize).
+4. **Inter-field padding** — the old encoder added a 4-byte
+   `HEADER_ALIGN` pad between each record's `name` and `data`
+   fields. Empirically OVMF reads `DataOffset = nameOff + nameSize`
+   (no padding); the alignment is applied only when walking to the
+   *next* record. Inserting padding caused `GetVariable` to return
+   the pad bytes prepended to the data, visible as a `\0\0`-prefixed
+   cmdline.
+
+Regression coverage:
+[`format_ovmf_test.go`](../../mock/pkg/go-filesystems/uefi/test/format_ovmf_test.go)
+verifies the wire layout (FV header bytes, GUIDs, FV checksum sums to
+zero, ArmVirt geometry) and round-trips a variable with a non-aligned
+name size — the exact case where the old inter-field-padding code
+silently corrupted reads.
 
 ## Reproduce
 
