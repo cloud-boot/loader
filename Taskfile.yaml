@@ -8,12 +8,15 @@
 version: '3'
 
 vars:
-  PROBE_AMD64_OUT:  BOOTX64-probe.EFI
-  PROBE_ARM64_OUT:  BOOTAA64-probe.EFI
-  LOADER_AMD64_OUT: BOOTX64.EFI
-  LOADER_ARM64_OUT: BOOTAA64.EFI
-  AMD64_TARGET:     targets/uefi-amd64.json
-  ARM64_TARGET:     targets/uefi-arm64.json
+  PROBE_AMD64_OUT:      BOOTX64-probe.EFI
+  PROBE_ARM64_OUT:      BOOTAA64-probe.EFI
+  LOADER_AMD64_OUT:     BOOTX64.EFI
+  LOADER_ARM64_OUT:     BOOTAA64.EFI
+  DISK_PROBE_AMD64_OUT: BOOTX64-disk-probe.EFI
+  DISK_PROBE_ARM64_OUT: BOOTAA64-disk-probe.EFI
+  AMD64_TARGET:         targets/uefi-amd64.json
+  ARM64_TARGET:         targets/uefi-arm64.json
+  DEBIAN_RAW:           '{{.TASKFILE_DIR}}/../uki/.debian-cache/trixie/arm64/genericcloud.labeled.raw'
 
 tasks:
 
@@ -257,9 +260,74 @@ tasks:
         -netdev user,id=n0 -device virtio-net-device,netdev=n0
         -nographic -serial mon:stdio
 
+  # ----- disk-probe (phase 5d step 1) -------------------------------------
+
+  disk-probe-thunk-arm64:
+    desc: Assemble the arm64 thunk for disk-probe.
+    dir: cmd/disk-probe
+    sources: [thunk-arm64.S]
+    generates: [thunk-arm64.o]
+    cmds:
+      - clang -target aarch64-pc-windows-gnu -c thunk-arm64.S -o thunk-arm64.o
+
+  disk-probe-compile-arm64:
+    desc: TinyGo-compile the disk-probe for arm64-UEFI.
+    deps: [disk-probe-thunk-arm64]
+    dir: cmd/disk-probe
+    sources:
+      - main.go
+      - '../../{{.ARM64_TARGET}}'
+    generates: [main-arm64.o]
+    cmds:
+      - tinygo build -target=../../{{.ARM64_TARGET}} -o main-arm64.o .
+
+  disk-probe-arm64:
+    desc: 'Build the arm64 disk-probe → {{.DISK_PROBE_ARM64_OUT}}.'
+    deps: [disk-probe-compile-arm64]
+    dir: cmd/disk-probe
+    cmds:
+      - >-
+        lld-link
+        /machine:arm64
+        /subsystem:efi_application
+        /entry:_start
+        /nodefaultlib
+        /force:unresolved
+        /base:0x10000
+        /out:{{.DISK_PROBE_ARM64_OUT}}
+        main-arm64.o thunk-arm64.o
+      - file {{.DISK_PROBE_ARM64_OUT}}
+
+  # qemu-disk-probe-arm64: boot the disk-probe with the Debian Trixie
+  # arm64 cloud image attached as a second virtio block device — that's
+  # the real partitioned ext4 layout we'll have to read in Phase 5d.
+  qemu-disk-probe-arm64:
+    desc: Run disk-probe under QEMU with the Debian cloud image attached.
+    deps: [disk-probe-arm64]
+    dir: cmd/disk-probe
+    preconditions:
+      - sh: 'test -f "{{.DEBIAN_RAW}}"'
+        msg: 'Debian cloud image missing — run `ARCH=arm64 task -t ../../uki/Taskfile.yaml label:debian:cloud` first.'
+    cmds:
+      - rm -f esp.img ovmf_vars_arm64.fd
+      - dd if=/dev/zero of=ovmf_vars_arm64.fd bs=1M count=64 status=none
+      - dd if=/dev/zero of=esp.img bs=1M count=64 status=none
+      - "mformat -i esp.img -F ::"
+      - "mmd -i esp.img ::EFI ::EFI/BOOT"
+      - "mcopy -i esp.img {{.DISK_PROBE_ARM64_OUT}} ::EFI/BOOT/BOOTAA64.EFI"
+      - >-
+        qemu-system-aarch64
+        -machine virt,gic-version=max,accel=hvf:tcg -cpu max -m 1024 -smp 2
+        -drive if=pflash,format=raw,readonly=on,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd
+        -drive if=pflash,format=raw,file=ovmf_vars_arm64.fd
+        -drive if=virtio,format=raw,file=esp.img,id=esp
+        -drive if=virtio,format=raw,file={{.DEBIAN_RAW}},id=cloud,readonly=on
+        -nographic -serial mon:stdio
+
   clean:
     cmds:
       - rm -f cmd/efi-probe/*.o cmd/efi-probe/*.EFI cmd/efi-probe/esp.img cmd/efi-probe/ovmf_vars_arm64.fd
+      - rm -f cmd/disk-probe/*.o cmd/disk-probe/*.EFI cmd/disk-probe/esp.img cmd/disk-probe/ovmf_vars_arm64.fd
       - rm -f cmd/efi-loader/*.o cmd/efi-loader/*.EFI cmd/efi-loader/esp.img cmd/efi-loader/ovmf_vars_arm64.fd
       - rm -rf cmd/efi-loader/esp-stage cmd/efi-loader/esp-loader.iso
       - rm -f cmd/efivar-stage/efivar-stage
