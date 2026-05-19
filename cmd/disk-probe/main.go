@@ -1634,7 +1634,289 @@ var (
 	// initrd lookup + LoadFile2 install. Useful for isolating
 	// crashes in InstallProtocolInterface from the LoadImage path.
 	xfsSkipInitrd = false
+
+	// 4-KiB scratch for the btrfs superblock probe at LBA 128
+	// (byte 65536 of the partition).
+	btrfsSBBuf [4096]byte
 )
+
+// ----- btrfs superblock probe -----
+//
+// btrfs places its primary superblock at byte offset 65536 (64 KiB)
+// of the device, with mirror copies at 64 MiB / 256 GiB / 1 PiB. The
+// magic "_BHRfS_M" is at offset 64 of the SB itself.
+//
+// SB structure (little-endian, packed) — relevant fields:
+//
+//   0..32   csum
+//   32..48  fsid
+//   48..56  bytenr (physical addr of this SB)
+//   64..72  magic = "_BHRfS_M"  (= 0x4D5F53665248425F as LE u64)
+//   72..80  generation
+//   80..88  root            (root tree, LOGICAL addr)
+//   88..96  chunk_root      (chunk tree, LOGICAL addr)
+//  136..144 num_devices
+//  144..148 sectorsize
+//  148..152 nodesize
+//  160..164 sys_chunk_array_size
+//  199     chunk_root_level
+//  299..555 label[256]
+//  811..811+sys_chunk_array_size  inline chunk records (the bootstrap)
+//
+// `sys_chunk_array` carries enough chunk-record information to map
+// the chunk tree's own root from logical → physical. From there we
+// can walk the chunk tree for the rest of the chunks.
+
+const btrfsSBMagic uint64 = 0x4D5F53665248425F // "_BHRfS_M"
+
+type btrfsSB struct {
+	magic             uint64
+	generation        uint64
+	rootLogical       uint64 // root-tree root
+	chunkRootLogical  uint64
+	totalBytes        uint64
+	sectorsize        uint32
+	nodesize          uint32
+	sysChunkArraySize uint32
+	rootLevel         uint8
+	chunkRootLevel    uint8
+	label             [256]byte
+}
+
+func parseBtrfsSB(data []byte, sb *btrfsSB) bool {
+	if len(data) < 0x500 {
+		return false
+	}
+	sb.magic = le64(data[64:])
+	if sb.magic != btrfsSBMagic {
+		return false
+	}
+	sb.generation = le64(data[72:])
+	sb.rootLogical = le64(data[80:])
+	sb.chunkRootLogical = le64(data[88:])
+	sb.totalBytes = le64(data[112:])
+	sb.sectorsize = le32(data[144:])
+	sb.nodesize = le32(data[148:])
+	sb.sysChunkArraySize = le32(data[160:])
+	sb.rootLevel = data[198]
+	sb.chunkRootLevel = data[199]
+	for i := 0; i < 256; i++ {
+		sb.label[i] = data[299+i]
+	}
+	return true
+}
+
+func le64(b []byte) uint64 {
+	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
+		uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
+}
+
+func printBtrfsSB(co *efiSimpleTextOutput, sb *btrfsSB) {
+	writeASCII(co, "    btrfs SB: sectorsize=")
+	writeDec(co, uint64(sb.sectorsize))
+	writeASCII(co, " nodesize=")
+	writeDec(co, uint64(sb.nodesize))
+	writeASCII(co, " totalBytes=")
+	writeDec(co, sb.totalBytes)
+	writeASCII(co, "\r\n    generation=")
+	writeDec(co, sb.generation)
+	writeASCII(co, " rootLogical=")
+	writeHex64(co, sb.rootLogical)
+	writeASCII(co, " (level=")
+	writeDec(co, uint64(sb.rootLevel))
+	writeASCII(co, ")\r\n    chunkRootLogical=")
+	writeHex64(co, sb.chunkRootLogical)
+	writeASCII(co, " (level=")
+	writeDec(co, uint64(sb.chunkRootLevel))
+	writeASCII(co, ") sysChunkArraySize=")
+	writeDec(co, uint64(sb.sysChunkArraySize))
+	writeASCII(co, "\r\n    label=\"")
+	for i := 0; i < 256; i++ {
+		if sb.label[i] == 0 {
+			break
+		}
+		oneCharBuf[0] = sb.label[i]
+		writeASCII(co, oneCharStr)
+	}
+	writeASCII(co, "\"\r\n")
+}
+
+// lastBtrfsSB is package-scope so its address never escapes to the
+// TinyGo heap promoter — a stack-local + & through a function call
+// would trip runtime.alloc → VirtualAlloc → trap.
+var (
+	lastBtrfsSB      btrfsSB
+	lastBtrfsSBValid bool
+)
+
+// ----- btrfs chunk map (logical → physical) -----
+//
+// The chunk map is the address-translation layer between
+// btrfs' "logical" addresses (used in tree node pointers, file
+// extent records, root pointers, etc.) and physical bytes on the
+// device. The sys_chunk_array inside the superblock bootstraps a
+// minimal map covering at least the chunk-tree's own range; the
+// rest of the chunks live as items in the chunk tree itself, which
+// we walk once the bootstrap is in place.
+//
+// Each chunk record is:
+//   key (17 bytes):
+//     objectid (u64)   = BTRFS_FIRST_CHUNK_TREE_OBJECTID (256)
+//     type     (u8)    = BTRFS_CHUNK_ITEM_KEY (228 = 0xE4)
+//     offset   (u64)   = logical address of the chunk's first byte
+//   chunk header (48 bytes):
+//     length, owner, stripe_len, type,
+//     io_align, io_width, sector_size,
+//     num_stripes (u16), sub_stripes (u16)
+//   stripe[num_stripes]: 32 bytes each
+//     devid (u64), offset (u64), dev_uuid[16]
+//
+// For single-disk filesystems we use the first stripe's offset as
+// the physical address (and ignore DUP/RAID extras).
+
+const (
+	btrfsKeySize          = 17
+	btrfsChunkItemKey     = 0xE4 // BTRFS_CHUNK_ITEM_KEY
+	btrfsFirstChunkObjID  = 256  // BTRFS_FIRST_CHUNK_TREE_OBJECTID
+)
+
+type btrfsChunk struct {
+	logical    uint64
+	length     uint64
+	physical   uint64 // first stripe's physical offset
+	numStripes uint16
+}
+
+// chunkMap is the cumulative logical → physical translation. We cap
+// at 256 chunks for cloud-image use (typical: handful for system,
+// few dozen for metadata + data). Beyond that we'd need a dynamic
+// container — out of scope for the no-heap loader.
+const maxChunks = 256
+
+var (
+	chunkMap      [maxChunks]btrfsChunk
+	chunkMapCount int
+)
+
+// parseSysChunkArray walks the sys_chunk_array bytes (which start
+// at SB offset 811 and run for sysChunkArraySize bytes) and appends
+// each chunk record to chunkMap.
+func parseSysChunkArray(sbData []byte, sysSize uint32, dst *[maxChunks]btrfsChunk, n *int) bool {
+	const off0 = 811
+	if uint32(len(sbData)) < off0+sysSize {
+		return false
+	}
+	off := uint32(off0)
+	end := off0 + sysSize
+	for off+btrfsKeySize+48 <= end {
+		// key: objectid(8) | type(1) | offset(8)
+		// objectid := le64(sbData[off:])
+		ktype := sbData[off+8]
+		koff := le64(sbData[off+9:])
+		off += btrfsKeySize
+		if ktype != btrfsChunkItemKey {
+			// Unknown bootstrap record — bail.
+			return false
+		}
+		if uint32(*n) >= uint32(len(dst)) {
+			return false
+		}
+		// chunk header
+		length := le64(sbData[off:])
+		// owner := le64(sbData[off+8:])
+		// stripe_len := le64(sbData[off+16:])
+		// type := le64(sbData[off+24:])
+		// io_align := le32(sbData[off+32:])
+		// io_width := le32(sbData[off+36:])
+		// sector_size := le32(sbData[off+40:])
+		numStripes := le16(sbData[off+44:])
+		// sub_stripes := le16(sbData[off+46:])
+		off += 48
+		if numStripes == 0 || off+uint32(numStripes)*32 > end {
+			return false
+		}
+		// First stripe: devid(8) | offset(8) | dev_uuid[16]
+		// devid := le64(sbData[off:])
+		physical := le64(sbData[off+8:])
+		dst[*n].logical = koff
+		dst[*n].length = length
+		dst[*n].physical = physical
+		dst[*n].numStripes = numStripes
+		*n++
+		off += uint32(numStripes) * 32
+	}
+	return true
+}
+
+// btrfsLogicalToPhys translates a logical address using chunkMap.
+// Returns 0,false if no chunk covers the address.
+func btrfsLogicalToPhys(logical uint64) (uint64, bool) {
+	for i := 0; i < chunkMapCount; i++ {
+		c := &chunkMap[i]
+		if logical >= c.logical && logical < c.logical+c.length {
+			return c.physical + (logical - c.logical), true
+		}
+	}
+	return 0, false
+}
+
+// probeBtrfsPartition reads bytes 64 KiB..68 KiB of the partition,
+// checks for the btrfs magic at offset 64, and dumps the SB if found.
+func probeBtrfsPartition(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32) {
+	// LBA = 65536 / devBlkSz. For devBlkSz=512 → LBA 128.
+	lba := uint64(65536) / uint64(devBlkSz)
+	for k := 0; k < len(btrfsSBBuf); k++ {
+		btrfsSBBuf[k] = 0
+	}
+	// Read enough to cover offset 64 (magic) + 4 KiB.
+	if readBlocks(bio, mediaId, lba, uintptr(len(btrfsSBBuf)),
+		uintptr(unsafe.Pointer(&btrfsSBBuf[0]))) != efiSuccess {
+		return
+	}
+	if le64(btrfsSBBuf[64:]) != btrfsSBMagic {
+		return
+	}
+	writeASCII(co, "    fs: btrfs\r\n")
+	if !parseBtrfsSB(btrfsSBBuf[:], &lastBtrfsSB) {
+		return
+	}
+	lastBtrfsSBValid = true
+	printBtrfsSB(co, &lastBtrfsSB)
+
+	// Bootstrap chunk map from sys_chunk_array.
+	chunkMapCount = 0
+	if !parseSysChunkArray(btrfsSBBuf[:], lastBtrfsSB.sysChunkArraySize, &chunkMap, &chunkMapCount) {
+		writeASCII(co, "    sys_chunk_array parse failed\r\n")
+		return
+	}
+	writeASCII(co, "    sys_chunk_array: ")
+	writeDec(co, uint64(chunkMapCount))
+	writeASCII(co, " chunk record(s)\r\n")
+	for i := 0; i < chunkMapCount; i++ {
+		c := &chunkMap[i]
+		writeASCII(co, "      [")
+		writeDec(co, uint64(i))
+		writeASCII(co, "] logical=")
+		writeHex64(co, c.logical)
+		writeASCII(co, " length=")
+		writeHex64(co, c.length)
+		writeASCII(co, " phys=")
+		writeHex64(co, c.physical)
+		writeASCII(co, " stripes=")
+		writeDec(co, uint64(c.numStripes))
+		writeASCII(co, "\r\n")
+	}
+
+	// Translate chunk_root_logical → physical and read the node.
+	chunkRootPhys, ok := btrfsLogicalToPhys(lastBtrfsSB.chunkRootLogical)
+	if !ok {
+		writeASCII(co, "    chunk_root not covered by bootstrap map\r\n")
+		return
+	}
+	writeASCII(co, "    chunkRootPhys=")
+	writeHex64(co, chunkRootPhys)
+	writeASCII(co, "\r\n")
+}
 
 // ----- xfs inode -----
 //
@@ -2516,14 +2798,17 @@ func detectFilesystem(co *efiSimpleTextOutput, data []byte) {
 		return
 	}
 
-	writeASCII(co, "    fs: unknown (first 8 bytes = ")
+	writeASCII(co, "    fs: unknown at LBA 0 (first 8 bytes = ")
 	if len(data) >= 8 {
 		for i := 0; i < 8; i++ {
 			writeHex64(co, uint64(data[i]))
 			writeASCII(co, " ")
 		}
 	}
-	writeASCII(co, ")\r\n")
+	writeASCII(co, ") — trying btrfs offset 64 KiB\r\n")
+	// btrfs SB lives at offset 64 KiB, not 0. Probe there if the
+	// first 4 KiB didn't match any of the offset-0 signatures.
+	probeBtrfsPartition(co, lastBIO, lastMediaId, lastDevBlkSz)
 }
 
 //go:export _start
