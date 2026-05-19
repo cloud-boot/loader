@@ -1744,6 +1744,332 @@ func readXfsInode(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32
 	return true
 }
 
+// ----- xfs extent decoding -----
+//
+// Each extent in an inode's data fork is a 128-bit BE bit-packed
+// record (xfs_bmbt_rec):
+//
+//   bit 0         flag (1 = unwritten extent)
+//   bits 1..54    startoff   (54-bit logical-block offset in the file)
+//   bits 55..106  startblock (52-bit FSB address — composite of
+//                              AG number + AG block number)
+//   bits 107..127 blockcount (21-bit)
+//
+// FSB encoding (XFS_FSB_TO_AGNO / AGBNO):
+//   agno  = startblock >> sb_agblklog
+//   agbno = startblock & ((1 << sb_agblklog) - 1)
+//   physicalBlock = agno*agblocks + agbno
+//   byteOff       = physicalBlock * blockSize
+
+type xfsExtent struct {
+	startoff   uint64
+	startblock uint64
+	count      uint32
+}
+
+func parseXfsExtent(raw []byte, e *xfsExtent) bool {
+	if len(raw) < 16 {
+		return false
+	}
+	w0 := be64(raw[0:])
+	w1 := be64(raw[8:])
+	// flag = (w0 >> 63) & 1 — we ignore it (unwritten extents in
+	// /boot files don't happen on cloud images).
+	e.startoff = (w0 >> 9) & ((uint64(1) << 54) - 1)
+	startblockHi := w0 & ((uint64(1) << 9) - 1)
+	startblockLo := w1 >> 21
+	e.startblock = (startblockHi << 43) | startblockLo
+	e.count = uint32(w1 & ((uint64(1) << 21) - 1))
+	return true
+}
+
+func fsbToByteOff(fsb uint64, sb *xfsSB) uint64 {
+	agno := fsb >> uint64(sb.agblklog)
+	agbno := fsb & ((uint64(1) << uint64(sb.agblklog)) - 1)
+	physBlk := agno*uint64(sb.agblocks) + agbno
+	return physBlk * uint64(sb.blockSize)
+}
+
+// ----- xfs short-form directory parser -----
+//
+// xfs_dir2_sf_hdr:
+//   1 byte  count        (# entries)
+//   1 byte  i8count      (# entries with 8-byte inumbers; >0 means
+//                          ALL entries — and parent — use 8-byte)
+//   N bytes parent       (4 or 8)
+//
+// xfs_dir2_sf_entry:
+//   1 byte  namelen
+//   2 bytes offset (tag, ignored)
+//   N bytes name (namelen)
+//   1 byte  ftype        (v5 only)
+//   N bytes inumber      (4 or 8 depending on i8count)
+
+func walkXfsDirShortForm(co *efiSimpleTextOutput, sfData []byte, isV5 bool,
+	callback func(name []byte, inumber uint64, ftype uint8) bool,
+) {
+	if len(sfData) < 2 {
+		return
+	}
+	count := uint32(sfData[0])
+	i8count := uint32(sfData[1])
+	use8 := i8count > 0
+	inumLen := uint32(4)
+	if use8 {
+		inumLen = 8
+	}
+	off := uint32(2 + inumLen) // skip hdr + parent
+	for i := uint32(0); i < count; i++ {
+		if uint32(len(sfData)) < off+3 {
+			break
+		}
+		namelen := uint32(sfData[off])
+		off++
+		off += 2 // skip tag
+		if uint32(len(sfData)) < off+namelen+inumLen {
+			break
+		}
+		name := sfData[off : off+namelen]
+		off += namelen
+		var ftype uint8
+		if isV5 {
+			ftype = sfData[off]
+			off++
+		}
+		var inumber uint64
+		if use8 {
+			inumber = be64(sfData[off:])
+		} else {
+			inumber = uint64(be32(sfData[off:]))
+		}
+		off += inumLen
+		if !callback(name, inumber, ftype) {
+			return
+		}
+	}
+	_ = co
+}
+
+// ----- xfs block-form directory parser -----
+//
+// One-block dir (xfs_dir2_block). Layout at offset 0 of the block:
+//
+//   xfs_dir3_data_hdr (v5) — 64 bytes:
+//     magic   = "XDB3" (0x58444233) — single-block dir
+//     crc, blkno, lsn, uuid, owner   (48 bytes blk_hdr)
+//     best_free[3]                    (12 bytes)
+//     pad                             (4 bytes)
+//
+//   Data entries (variable length, 8-byte aligned)
+//
+//   Leaf entries (xfs_dir2_leaf_entry, 8 B each: hash + offset)
+//
+//   xfs_dir2_block_tail (8 B at end):
+//     count, stale
+//
+// Walking: from data-header-end up to (blockSize - 8 - count*8),
+// each record is either an entry (8-byte inumber + 1-byte namelen
+// + name + 1-byte ftype + 2-byte tag) or unused (2-byte 0xFFFF +
+// 2-byte length + 2-byte tag). All entry lengths rounded to 8.
+
+const (
+	xfsDir3BlockMagic uint32 = 0x58444233 // "XDB3"
+	xfsDir3DataMagic  uint32 = 0x58444433 // "XDD3"
+	xfsDir2BlockMagic uint32 = 0x58443242 // "XD2B"
+	xfsDir2DataMagic  uint32 = 0x58443244 // "XD2D"
+	xfsDir3HdrSize           = 64
+	xfsDir2HdrSize           = 16
+)
+
+func walkXfsDirBlockForm(co *efiSimpleTextOutput, block []byte, blockSize uint32, isV5 bool,
+	callback func(name []byte, inumber uint64, ftype uint8) bool,
+) {
+	if uint32(len(block)) < blockSize {
+		return
+	}
+	magic := be32(block[0:])
+	if magic != xfsDir3BlockMagic && magic != xfsDir2BlockMagic {
+		writeASCII(co, "    walkXfsDirBlockForm: bad magic ")
+		writeHex64(co, uint64(magic))
+		writeASCII(co, "\r\n")
+		return
+	}
+	hdrSize := uint32(xfsDir3HdrSize)
+	if !isV5 || magic == xfsDir2BlockMagic {
+		hdrSize = xfsDir2HdrSize
+	}
+	// Tail at end of block.
+	tailOff := blockSize - 8
+	leafCount := be32(block[tailOff:])
+	leafStart := tailOff - leafCount*8
+
+	off := hdrSize
+	for off+8 < leafStart {
+		first2 := be16(block[off:])
+		if first2 == 0xFFFF {
+			// xfs_dir2_data_unused: 2-byte freetag + 2-byte length + 2-byte tag
+			length := uint32(be16(block[off+2:]))
+			if length < 6 {
+				break
+			}
+			off += length
+			continue
+		}
+		// xfs_dir2_data_entry.
+		inumber := be64(block[off:])
+		namelen := uint32(block[off+8])
+		if namelen == 0 || off+9+namelen > leafStart {
+			break
+		}
+		name := block[off+9 : off+9+namelen]
+		var ftype uint8
+		var recLen uint32
+		if isV5 {
+			ftype = block[off+9+namelen]
+			recLen = 8 + 1 + namelen + 1 + 2 // inumber+namelen+name+ftype+tag
+		} else {
+			recLen = 8 + 1 + namelen + 2
+		}
+		// Round up to 8-byte alignment.
+		recLen = (recLen + 7) &^ 7
+		if !callback(name, inumber, ftype) {
+			return
+		}
+		off += recLen
+	}
+}
+
+// ----- xfs file read via extents -----
+//
+// readXfsFile pulls the entire file into `outAddr`. Only handles the
+// in-line extent format (di_format = 2) with nextents records sitting
+// right after the inode core. Btree-format files (di_format = 3) are
+// out of scope for the bring-up; kernels + initrds on cloud images
+// fit comfortably under the few-hundred-extent ceiling.
+
+func readXfsFile(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *xfsSB, inoNum uint64, outAddr uintptr, outCap uint64,
+) uint64 {
+	if !readXfsInode(co, bio, mediaId, devBlkSz, sb, inoNum) {
+		return 0
+	}
+	var ino xfsInode
+	if !parseXfsInode(xfsInodeBuf[:], &ino) {
+		return 0
+	}
+	if ino.format != xfsFormatExtents {
+		writeASCII(co, "    readXfsFile: unsupported format\r\n")
+		return 0
+	}
+	if ino.size > outCap {
+		writeASCII(co, "    readXfsFile: file too big for buffer\r\n")
+		return 0
+	}
+	dfo := xfsDataForkOffset(ino.version)
+	for i := uint32(0); i < ino.nextents; i++ {
+		off := dfo + i*16
+		if uint32(len(xfsInodeBuf)) < off+16 {
+			writeASCII(co, "    readXfsFile: extent past inode\r\n")
+			return 0
+		}
+		var e xfsExtent
+		if !parseXfsExtent(xfsInodeBuf[off:off+16], &e) {
+			return 0
+		}
+		byteOff := fsbToByteOff(e.startblock, sb)
+		bytes := uint64(e.count) * uint64(sb.blockSize)
+		dst := outAddr + uintptr(e.startoff)*uintptr(sb.blockSize)
+		lba := byteOff / uint64(devBlkSz)
+		if readBlocks(bio, mediaId, lba, uintptr(bytes), dst) != efiSuccess {
+			writeASCII(co, "    readXfsFile: ReadBlocks failed\r\n")
+			return 0
+		}
+	}
+	return ino.size
+}
+
+// listXfsRoot prints all entries in a partition's root directory.
+// Diagnostic for the bring-up — handles both short-form (format=1,
+// inline in inode) and block-form (format=2 with nextents=1, a
+// single 4-KiB data block).
+func listXfsRoot(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32, sb *xfsSB) {
+	if !readXfsInode(co, bio, mediaId, devBlkSz, sb, sb.rootIno) {
+		writeASCII(co, "    listXfsRoot: read inode failed\r\n")
+		return
+	}
+	var ino xfsInode
+	if !parseXfsInode(xfsInodeBuf[:], &ino) {
+		return
+	}
+	isV5 := ino.version >= 3
+	dfo := xfsDataForkOffset(ino.version)
+
+	switch ino.format {
+	case xfsFormatLocal:
+		// Short-form dir. Data lives at the inode's data-fork
+		// offset, length = di_size.
+		if uint32(len(xfsInodeBuf)) < dfo+uint32(ino.size) {
+			writeASCII(co, "    short-form dir past inode\r\n")
+			return
+		}
+		walkXfsDirShortForm(co, xfsInodeBuf[dfo:dfo+uint32(ino.size)], isV5,
+			func(name []byte, inumber uint64, ftype uint8) bool {
+				writeASCII(co, "      [ino=")
+				writeDec(co, inumber)
+				writeASCII(co, " ft=")
+				writeDec(co, uint64(ftype))
+				writeASCII(co, "] ")
+				for i := 0; i < len(name); i++ {
+					oneCharBuf[0] = name[i]
+					writeASCII(co, oneCharStr)
+				}
+				writeASCII(co, "\r\n")
+				return true
+			})
+
+	case xfsFormatExtents:
+		// Block-form dir: read the single extent's block(s) and
+		// walk. For the cloud-image /boot case nextents=1 covers it.
+		if ino.nextents == 0 {
+			writeASCII(co, "    extents-format dir but nextents=0\r\n")
+			return
+		}
+		var e xfsExtent
+		if !parseXfsExtent(xfsInodeBuf[dfo:dfo+16], &e) {
+			return
+		}
+		byteOff := fsbToByteOff(e.startblock, sb)
+		lba := byteOff / uint64(devBlkSz)
+		for k := 0; k < len(dirBuf); k++ {
+			dirBuf[k] = 0
+		}
+		if readBlocks(bio, mediaId, lba, uintptr(sb.blockSize),
+			uintptr(unsafe.Pointer(&dirBuf[0]))) != efiSuccess {
+			writeASCII(co, "    block-form dir read failed\r\n")
+			return
+		}
+		walkXfsDirBlockForm(co, dirBuf[:], sb.blockSize, isV5,
+			func(name []byte, inumber uint64, ftype uint8) bool {
+				writeASCII(co, "      [ino=")
+				writeDec(co, inumber)
+				writeASCII(co, " ft=")
+				writeDec(co, uint64(ftype))
+				writeASCII(co, "] ")
+				for i := 0; i < len(name); i++ {
+					oneCharBuf[0] = name[i]
+					writeASCII(co, oneCharStr)
+				}
+				writeASCII(co, "\r\n")
+				return true
+			})
+
+	default:
+		writeASCII(co, "    listXfsRoot: unsupported dir format ")
+		writeDec(co, uint64(ino.format))
+		writeASCII(co, "\r\n")
+	}
+}
+
 func printXfsInode(co *efiSimpleTextOutput, ino *xfsInode) {
 	writeASCII(co, "    xfs inode: magic=")
 	writeHex64(co, uint64(ino.magic))
@@ -1962,6 +2288,8 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 				var rino xfsInode
 				if parseXfsInode(xfsInodeBuf[:], &rino) {
 					printXfsInode(co, &rino)
+					writeASCII(co, "    root dir contents:\r\n")
+					listXfsRoot(co, lastBIO, lastMediaId, lastDevBlkSz, &lastXfsSB)
 				} else {
 					writeASCII(co, "    xfs root inode parse failed\r\n")
 				}
