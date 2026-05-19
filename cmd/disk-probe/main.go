@@ -557,6 +557,247 @@ func readInode(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32, s
 // Sized for 256 (= ext4 default); 128-byte ext2 inodes fit too.
 var rawInodeBuf [256]byte
 
+// dirBuf is a separate 4-KiB scratch for reading directory data
+// blocks. Kept distinct from probeBuf (used by readInode internally)
+// so directory traversal can keep multiple buffers live at once.
+var dirBuf [4096]byte
+
+// inodeExtents caches the parsed extent tree of the most-recently-
+// read inode (depth-0 leaves only — caps at 4 inline extents). The
+// caller copies into here right after readInode, then can issue more
+// readInode/readDataBlock calls without clobbering the extent info.
+type ext4Extent struct {
+	logical  uint32
+	length   uint16
+	physical uint64
+}
+
+var (
+	inodeExtents     [4]ext4Extent
+	inodeExtentCount int
+	inodeExtentDepth uint16
+	inodeSizeBytes   uint64
+)
+
+// snapshotInodeExtents must be called immediately after readInode
+// (while rawInodeBuf still holds the just-read inode). It populates
+// inodeExtents / inodeExtentCount / inodeExtentDepth / inodeSizeBytes
+// from rawInodeBuf so the caller can issue further inode/data reads
+// safely.
+func snapshotInodeExtents() bool {
+	var ino ext4Inode
+	if !parseInode(rawInodeBuf[:], &ino) {
+		return false
+	}
+	inodeSizeBytes = (uint64(ino.sizeHi) << 32) | uint64(ino.sizeLo)
+	iblock := rawInodeBuf[inodeBlockOff : inodeBlockOff+inodeBlockSize]
+	var eh extentHeader
+	if !parseExtentHeader(iblock, &eh) {
+		return false
+	}
+	inodeExtentDepth = eh.depth
+	inodeExtentCount = 0
+	// Only inline leaves for now (depth == 0). Index nodes get
+	// walked in a later step.
+	if eh.depth != 0 {
+		return true
+	}
+	for i := uint16(0); i < eh.entries && int(i) < len(inodeExtents); i++ {
+		off := 12 + int(i)*12
+		inodeExtents[i].logical = le32(iblock[off+0:])
+		inodeExtents[i].length = le16(iblock[off+4:])
+		startHi := le16(iblock[off+6:])
+		startLo := le32(iblock[off+8:])
+		inodeExtents[i].physical = (uint64(startHi) << 32) | uint64(startLo)
+		inodeExtentCount++
+	}
+	return true
+}
+
+// readDataBlock reads one filesystem-block of an inode's data into
+// `out`. logicalBlock is the file-relative block index (0 = first
+// block of the file). Returns false if the logical block isn't
+// mapped (sparse hole) or extents are too complex for this step.
+func readDataBlock(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *ext4SB, logicalBlock uint32, out *[4096]byte) bool {
+	if inodeExtentDepth != 0 {
+		writeASCII(co, "    readDataBlock: depth>0 not implemented yet\r\n")
+		return false
+	}
+	for i := 0; i < inodeExtentCount; i++ {
+		e := &inodeExtents[i]
+		if logicalBlock >= e.logical && logicalBlock < e.logical+uint32(e.length) {
+			physBlk := e.physical + uint64(logicalBlock-e.logical)
+			lba := physBlk * sb.blockSize / uint64(devBlkSz)
+			for k := 0; k < len(out); k++ {
+				out[k] = 0
+			}
+			rst := readBlocks(bio, mediaId, lba, uintptr(sb.blockSize),
+				uintptr(unsafe.Pointer(&out[0])))
+			return rst == efiSuccess
+		}
+	}
+	return false
+}
+
+// findInDir reads dirIno's data blocks and looks for an entry whose
+// name matches `name`. Returns the child inode number and file type
+// (1=regular, 2=directory, …) on success.
+//
+// Caps at scanning the first INODE_DIR_MAX_BLOCKS blocks of the dir,
+// which is more than enough for /boot/ on a stock cloud image.
+const inodeDirMaxBlocks = 64
+
+func findInDir(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *ext4SB, dirIno uint32, name []byte,
+) (childIno uint32, fileType uint8, found bool) {
+	if !readInode(co, bio, mediaId, devBlkSz, sb, dirIno) ||
+		!snapshotInodeExtents() {
+		return 0, 0, false
+	}
+	maxBlocks := uint32(inodeSizeBytes / sb.blockSize)
+	if uint64(maxBlocks)*sb.blockSize < inodeSizeBytes {
+		maxBlocks++
+	}
+	if maxBlocks > inodeDirMaxBlocks {
+		maxBlocks = inodeDirMaxBlocks
+	}
+	for b := uint32(0); b < maxBlocks; b++ {
+		if !readDataBlock(co, bio, mediaId, devBlkSz, sb, b, &dirBuf) {
+			continue
+		}
+		// Walk ext4_dir_entry_2 records.
+		off := uint32(0)
+		for off+8 <= uint32(sb.blockSize) {
+			ent := le32(dirBuf[off:])
+			recLen := uint32(le16(dirBuf[off+4:]))
+			nameLen := uint32(dirBuf[off+6])
+			ft := dirBuf[off+7]
+			if recLen == 0 || recLen < 8 || off+recLen > uint32(sb.blockSize) {
+				break
+			}
+			if ent != 0 && nameLen > 0 && uint32(len(name)) == nameLen {
+				if bytesEqual(dirBuf[off+8:off+8+nameLen], name) {
+					return ent, ft, true
+				}
+			}
+			off += recLen
+		}
+	}
+	return 0, 0, false
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// resolvePath walks an absolute path "/a/b/c" component-by-component
+// starting from inode 2 (root). Returns the final inode number and
+// file type. Components are passed as a single string with '/' as
+// separator; leading/trailing slashes tolerated.
+func resolvePath(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *ext4SB, path string,
+) (uint32, uint8, bool) {
+	cur := uint32(2) // root
+	curFT := uint8(2) // directory
+	i := 0
+	for i < len(path) {
+		// Skip slashes.
+		for i < len(path) && path[i] == '/' {
+			i++
+		}
+		if i >= len(path) {
+			break
+		}
+		// Locate next slash.
+		j := i
+		for j < len(path) && path[j] != '/' {
+			j++
+		}
+		name := path[i:j]
+		// findInDir doesn't accept strings (no heap → []byte). Reuse a
+		// fixed name buffer.
+		for k := 0; k < len(nameScratch); k++ {
+			nameScratch[k] = 0
+		}
+		if len(name) > len(nameScratch) {
+			return 0, 0, false
+		}
+		copy(nameScratch[:], name)
+		ino, ft, ok := findInDir(co, bio, mediaId, devBlkSz, sb, cur, nameScratch[:len(name)])
+		if !ok {
+			return 0, 0, false
+		}
+		cur = ino
+		curFT = ft
+		i = j
+	}
+	return cur, curFT, true
+}
+
+var nameScratch [255]byte
+
+// Hard-coded name buffers for the bring-up path. Keeps us away from
+// any string-handling code while we're proving the inode/dir reader
+// works against a real cloud image.
+var bootNameBuf = [...]byte{'b', 'o', 'o', 't'}
+
+// listDir prints every name in `dirIno`. Diagnostic helper — Step 5
+// will replace this with a name-matching pass that locates a kernel
+// like "vmlinuz-6.1.0-cloud-arm64".
+func listDir(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *ext4SB, dirIno uint32,
+) {
+	if !readInode(co, bio, mediaId, devBlkSz, sb, dirIno) ||
+		!snapshotInodeExtents() {
+		writeASCII(co, "    listDir: read/parse failed\r\n")
+		return
+	}
+	maxBlocks := uint32(inodeSizeBytes / sb.blockSize)
+	if uint64(maxBlocks)*sb.blockSize < inodeSizeBytes {
+		maxBlocks++
+	}
+	if maxBlocks > inodeDirMaxBlocks {
+		maxBlocks = inodeDirMaxBlocks
+	}
+	for b := uint32(0); b < maxBlocks; b++ {
+		if !readDataBlock(co, bio, mediaId, devBlkSz, sb, b, &dirBuf) {
+			continue
+		}
+		off := uint32(0)
+		for off+8 <= uint32(sb.blockSize) {
+			ent := le32(dirBuf[off:])
+			recLen := uint32(le16(dirBuf[off+4:]))
+			nameLen := uint32(dirBuf[off+6])
+			ft := dirBuf[off+7]
+			if recLen == 0 || recLen < 8 || off+recLen > uint32(sb.blockSize) {
+				break
+			}
+			if ent != 0 && nameLen > 0 {
+				writeASCII(co, "      [")
+				writeDec(co, uint64(ent))
+				writeASCII(co, "/")
+				writeDec(co, uint64(ft))
+				writeASCII(co, "] ")
+				for i := uint32(0); i < nameLen; i++ {
+					oneCharBuf[0] = dirBuf[off+8+i]
+					writeASCII(co, oneCharStr)
+				}
+				writeASCII(co, "\r\n")
+			}
+			off += recLen
+		}
+	}
+}
+
 // dumpExtentTree prints the extent header + entries from a raw 60-byte
 // i_block area. Index nodes are reported but not followed (the
 // follow-the-pointer path comes in step 4 / 5 once we need it for
@@ -846,25 +1087,20 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 		detectFilesystem(co, probeBuf[:])
 		if lastSBValid {
 			ext4InspectGroupDesc(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB)
-			// Read root inode (always #2) and dump its extent tree.
-			// This validates inode locating + extent header parsing
-			// without yet following pointers to child nodes.
-			if readInode(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB, 2) {
-				var rootIno ext4Inode
-				if parseInode(rawInodeBuf[:], &rootIno) {
-					sz := (uint64(rootIno.sizeHi) << 32) | uint64(rootIno.sizeLo)
-					writeASCII(co, "    inode #2: mode=")
-					writeHex64(co, uint64(rootIno.mode))
-					writeASCII(co, " size=")
-					writeDec(co, sz)
-					writeASCII(co, " flags=")
-					writeHex64(co, uint64(rootIno.flags))
-					if rootIno.flags&inodeFlagExtents != 0 {
-						writeASCII(co, " (extents)")
-					}
-					writeASCII(co, "\r\n")
-					dumpExtentTree(co, rawInodeBuf[inodeBlockOff:inodeBlockOff+inodeBlockSize])
-				}
+			// Find /boot via a single findInDir call from root (#2).
+			// resolvePath is reserved for the multi-component case
+			// once this baseline is proven.
+			bootIno, bootFT, ok := findInDir(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB,
+				2, bootNameBuf[:4])
+			if ok {
+				writeASCII(co, "    /boot inode=")
+				writeDec(co, uint64(bootIno))
+				writeASCII(co, " fileType=")
+				writeDec(co, uint64(bootFT))
+				writeASCII(co, "\r\n")
+				listDir(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB, bootIno)
+			} else {
+				writeASCII(co, "    /boot: not found in root\r\n")
 			}
 		}
 	}
