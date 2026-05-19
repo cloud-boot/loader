@@ -676,14 +676,18 @@ func installInitrdProtocol(co *efiSimpleTextOutput, bs *efiBootServices) bool {
 // ----- top-level disk-mode boot orchestrator -----
 
 // cloudDiskCtx caches a single ext4 partition's BlockIO context once
-// detectExt4 succeeds, so the kernel/initrd reads don't have to
-// re-walk the BlockIO handle list.
+// scanForExt4 lands on a partition that *also* contains a vmlinuz-*
+// either at its root (Fedora-style separate /boot) or under /boot/
+// (Debian-style single rootfs). cloudKernelDir records which inode
+// the kernel lives in (2 for partition-root, /boot's inode for
+// inside-rootfs); the initrd lookup uses the same directory.
 var (
-	cloudBIO       uintptr
-	cloudMediaId   uint32
-	cloudDevBlkSz  uint32
-	cloudSB        ext4SB
-	cloudFoundExt4 bool
+	cloudBIO         uintptr
+	cloudMediaId     uint32
+	cloudDevBlkSz    uint32
+	cloudSB          ext4SB
+	cloudFoundExt4   bool
+	cloudKernelDir   uint32 // inode of the directory holding vmlinuz-*
 )
 
 // tryCloudDiskBoot is the Phase 5d fallback: walk BlockIO handles
@@ -704,28 +708,13 @@ func tryCloudDiskBoot(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle 
 	writeDec(co, cloudSB.blockSize)
 	writeASCII(co, "\r\n")
 
-	// Try /vmlinuz-* at the partition's root first — that's the
-	// Fedora / RHEL layout where /boot is a separate (ext4 or xfs)
-	// partition. If absent, fall back to /boot/vmlinuz-* — the
-	// Debian / Ubuntu / Alpine layout where /boot lives inside the
-	// rootfs. `kernelDir` records which inode actually holds the
-	// kernel so the initrd lookup below targets the same directory.
-	kernelDir := uint32(2)
+	// scanForExt4 already located the partition AND the directory
+	// (cloudKernelDir) that holds vmlinuz-*. Re-resolve the inode
+	// number now that the per-partition state is committed.
 	kIno, _, kOK := findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
-		2, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
+		cloudKernelDir, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
 	if !kOK {
-		bootIno, _, hasBoot := findInDir(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
-			2, bootDirName[:4])
-		if hasBoot {
-			kIno, _, kOK = findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
-				bootIno, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
-			if kOK {
-				kernelDir = bootIno
-			}
-		}
-	}
-	if !kOK {
-		writeASCII(co, "  no vmlinuz-* at / or /boot\r\n")
+		writeASCII(co, "  scanForExt4 picked a partition with no vmlinuz?\r\n")
 		return false
 	}
 	writeASCII(co, "  kernel: ")
@@ -763,13 +752,13 @@ func tryCloudDiskBoot(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle 
 	// so a single ext4 walker handles both /boot-style and
 	// dedicated-/boot-partition (Fedora) layouts.
 	iIno, _, iOK := findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
-		kernelDir, initrdPrefix[:], &initrdName, &initrdNameLen)
+		cloudKernelDir, initrdPrefix[:], &initrdName, &initrdNameLen)
 	if !iOK {
 		// initramfsPrefix is defined in xfs.go (RHEL family
 		// convention) — share it so the ext4 walker also matches
 		// Fedora-style /boot/initramfs-*.img.
 		iIno, _, iOK = findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
-			kernelDir, initramfsPrefix[:], &initrdName, &initrdNameLen)
+			cloudKernelDir, initramfsPrefix[:], &initrdName, &initrdNameLen)
 	}
 	if !iOK {
 		writeASCII(co, "  no initrd alongside kernel — continuing without\r\n")
@@ -872,12 +861,128 @@ func scanForExt4(co *efiSimpleTextOutput, bs *efiBootServices) bool {
 		if !parseExt4SB(probeBuf[:], &cloudSB) {
 			continue
 		}
+		// Provisionally commit to this partition while we look for
+		// vmlinuz. If no kernel is here, keep walking; the next ext4
+		// partition (if any) gets a turn.
 		cloudBIO = bioHolder
 		cloudMediaId = media.mediaId
 		cloudDevBlkSz = media.blockSize
-		cloudFoundExt4 = true
-		_ = co
+		// Try partition-root first (Fedora-style separate /boot), then
+		// /boot/ inside the rootfs (Debian-style). Sanity-check that
+		// the candidate kernel is actually a PE/COFF binary — Ubuntu's
+		// cloudimg-rootfs has placeholder /boot/vmlinuz-* files that
+		// FAIL LoadImage (the real kernel lives on the dedicated BOOT
+		// partition). Without the PE check we'd lock onto the
+		// placeholder and never try the real partition.
+		kIno, _, ok := findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
+			2, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
+		if ok && validatePEKernel(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB, kIno) {
+			cloudKernelDir = 2
+			cloudFoundExt4 = true
+			return true
+		}
+		bootIno, _, hasBoot := findInDir(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
+			2, bootDirName[:4])
+		if hasBoot {
+			kIno, _, ok = findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
+				bootIno, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
+			if ok && validatePEKernel(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB, kIno) {
+				cloudKernelDir = bootIno
+				cloudFoundExt4 = true
+				return true
+			}
+		}
+		// No kernel here — continue to the next partition.
+	}
+	return false
+}
+
+// validatePEKernel reads the first fs-block of `kIno` and checks for
+// the PE/COFF "MZ" header. Catches Ubuntu-cloudimg-rootfs's
+// placeholder /boot/vmlinuz files (which exist but aren't valid
+// EFI-stub kernels — the real ones live on the dedicated BOOT
+// partition) so scanForExt4 can move on to the next partition.
+//
+// Reaches into the inode's extent tree directly (depth-0 inline OR
+// depth-1 via extent-index pointers) — readDataBlock only handles
+// depth-0 and would reject every modern kernel ≥ ~10 MiB.
+func validatePEKernel(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *ext4SB, inoNum uint32,
+) bool {
+	if !readInode(co, bio, mediaId, devBlkSz, sb, inoNum) {
+		return false
+	}
+	var ino ext4Inode
+	if !parseInode(rawInodeBuf[:], &ino) {
+		return false
+	}
+	sz := (uint64(ino.sizeHi) << 32) | uint64(ino.sizeLo)
+	if sz < 4096 {
+		return false
+	}
+	iblock := rawInodeBuf[inodeBlockOff : inodeBlockOff+inodeBlockSize]
+	var eh extentHeader
+	if !parseExtentHeader(iblock, &eh) || eh.entries == 0 {
+		return false
+	}
+	// Find the extent covering logical block 0.
+	var phys uint64
+	switch eh.depth {
+	case 0:
+		// First leaf entry covers block 0 in any non-sparse file.
+		off := 12
+		eeBlock := le32(iblock[off+0:])
+		if eeBlock != 0 {
+			return false
+		}
+		startHi := le16(iblock[off+6:])
+		startLo := le32(iblock[off+8:])
+		phys = (uint64(startHi) << 32) | uint64(startLo)
+	case 1:
+		// First idx entry points at the first leaf block.
+		off := 12
+		eiLeafLo := le32(iblock[off+4:])
+		eiLeafHi := le16(iblock[off+8:])
+		eiLeaf := (uint64(eiLeafHi) << 32) | uint64(eiLeafLo)
+		leafLBA := eiLeaf * sb.blockSize / uint64(devBlkSz)
+		if readBlocks(bio, mediaId, leafLBA, uintptr(sb.blockSize),
+			uintptr(unsafe.Pointer(&extentLeafBuf[0]))) != efiSuccess {
+			return false
+		}
+		var leafEh extentHeader
+		if !parseExtentHeader(extentLeafBuf[:], &leafEh) || leafEh.depth != 0 || leafEh.entries == 0 {
+			return false
+		}
+		off = 12
+		eeBlock := le32(extentLeafBuf[off+0:])
+		if eeBlock != 0 {
+			return false
+		}
+		startHi := le16(extentLeafBuf[off+6:])
+		startLo := le32(extentLeafBuf[off+8:])
+		phys = (uint64(startHi) << 32) | uint64(startLo)
+	default:
+		return false
+	}
+	lba := phys * sb.blockSize / uint64(devBlkSz)
+	if readBlocks(bio, mediaId, lba, uintptr(sb.blockSize),
+		uintptr(unsafe.Pointer(&dirBuf[0]))) != efiSuccess {
+		return false
+	}
+	// "MZ" → genuine PE/COFF EFI binary, the happy path.
+	if dirBuf[0] == 'M' && dirBuf[1] == 'Z' {
 		return true
+	}
+	// "1F 8B 08 …" → gzip-compressed kernel (Ubuntu arm64 ships
+	// /boot/vmlinuz-*-generic as a gzip-compressed Image; GRUB
+	// decompresses it before LoadImage). We'd need an inflate
+	// implementation to handle this — out of scope for the
+	// no-heap-under-UEFI loader without a substantial dependency.
+	// Reject and let the caller move on (other distros'
+	// uncompressed Image-format kernels still work).
+	if dirBuf[0] == 0x1F && dirBuf[1] == 0x8B {
+		writeASCII(co, " (gzip-compressed kernel — not directly EFI-bootable)\r\n")
+		return false
 	}
 	return false
 }
