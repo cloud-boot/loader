@@ -32,8 +32,8 @@ non-Linux EFI image works the same way.
 | 4 | DNS-SRV via `EFI_DNS4_PROTOCOL`; multi-endpoint failover; minimal cosign | — |
 | 5a | Disk-mode minimal: SFS walk, open `\EFI\Linux\cloud-boot.efi`, `LoadImage` + `StartImage` | done — see [Phase 5a result](#phase-5a-result) |
 | 5b | Cmdline propagation: EFI variable (`CloudBootCmdline`) primary, `\cmdline` file fallback; `loaded-image->load_options` patched on the child | done — see [Phase 5b result](#phase-5b-result) |
-| 5c | Multiple candidate UKIs, fallback order, `CloudBootTarget` selector | — |
-| 5d | Chain a real Linux EFI-stub kernel (vmlinuz.efi) and confirm cmdline reaches userspace | — |
+| 5c | Multiple candidate UKIs, fallback order, `CloudBootTarget` selector | done |
+| 5d | Boot the kernel inside an *unmodified* Linux cloud distribution image: walk BlockIO, read ext4 directly, locate `/boot/vmlinuz-*` + `/boot/initrd.img-*`, `EFI_LOAD_FILE2_PROTOCOL` for initrd, `LoadImage` + `StartImage` | done — see [Phase 5d result](#phase-5d-result) |
 
 ## Phase 0 result
 
@@ -221,6 +221,114 @@ verifies the wire layout (FV header bytes, GUIDs, FV checksum sums to
 zero, ArmVirt geometry) and round-trips a variable with a non-aligned
 name size — the exact case where the old inter-field-padding code
 silently corrupted reads.
+
+## Phase 5d result
+
+The production loader (`BOOTAA64.EFI`, single binary) now boots an
+*unmodified* Linux distribution cloud disk image end-to-end. There's
+no `\EFI\Linux\*.efi` staged on the FAT volume — the kernel and
+initrd come straight out of the cloud image's ext4 rootfs.
+
+Pipeline (after the FAT-volume Phase 5a-5c search returns no UKI):
+
+1. `LocateHandleBuffer(EFI_BLOCK_IO_PROTOCOL)` walks every block
+   device the firmware exposes.
+2. For each logical partition: ReadBlocks 4 KiB at LBA 0, check for
+   the ext4 magic `0xEF53` at offset 0x438.
+3. On the first ext4 partition: parse the full superblock (block
+   size, inode size, inodes-per-group, descSize, 64-bit/extents
+   feature flags) and remember the BlockIO context.
+4. Read inode 2 (root directory) → walk its extent tree → find
+   `boot` via `ext4_dir_entry_2` records.
+5. Find `vmlinuz-*` and `initrd.img-*` under `/boot` by prefix
+   match.
+6. `AllocatePool(EfiLoaderData)` two buffers, sized to the inode
+   `s_size_lo|s_size_hi`. Run `readFile` against each: depth-0 or
+   depth-1 extent walker; `ReadBlocks` straight into the pool.
+7. Build a 24-byte device path (`MEDIA_VENDOR` with
+   `LINUX_EFI_INITRD_MEDIA_GUID` + end terminator) and an
+   `EFI_LOAD_FILE2_PROTOCOL` instance whose callback returns
+   `initrdSize` bytes from our buffer. Publish both protocols on a
+   fresh handle via `InstallProtocolInterface`.
+8. `LoadImage(SourceBuffer = kernel buffer)` to get a child image
+   handle. `patchChildCmdline` patches the EFI-var-staged cmdline
+   into `LoadedImage.LoadOptions`. `StartImage`.
+9. Linux EFI stub takes over — finds our LoadFile2 handle via the
+   media-vendor GUID walk, copies the initrd out, calls
+   `ExitBootServices`, jumps to the kernel.
+10. Linux boots all the way to userspace `init`.
+
+Verified transcript (`qemu-loader-cloud-arm64` against Debian
+Trixie arm64 genericcloud raw image, ~600 MB, untouched on disk —
+a fresh qcow2 overlay catches Linux's boot-time writes):
+
+```text
+cloud-boot/loader — phase 5b/5c/5d
+  cmdline from EFI var CloudBootCmdline (45 chars): console=ttyAMA0 root=LABEL=cloudimg-rootfs ro
+cmdline source: EFI variable
+  trying UKI \EFI\Linux\cloud-boot.efi
+no UKI found, falling back to cloud-disk
+trying cloud-disk fallback (ext4)
+  ext4 partition found, blockSize=4096
+  kernel: vmlinuz-6.12.88+deb13-cloud-arm64
+  initrd: initrd.img-6.12.88+deb13-cloud-arm64
+  initrd protocols installed
+  cloud-disk kernel LoadImage OK, child=…
+  patched child LoadOptions (92 bytes)
+StartImage...
+
+EFI stub: Loaded initrd from LINUX_EFI_INITRD_MEDIA_GUID device path
+EFI stub: Exiting boot services...
+[    0.000000] Linux version 6.12.88+deb13-cloud-arm64 …
+…
+[  OK  ] Reached target multi-user.target - Multi-User System.
+
+Debian GNU/Linux 13 debian-cloud-boot ttyAMA0
+debian-cloud-boot login:
+```
+
+That's the project goal achieved: an off-the-shelf Debian Trixie
+arm64 cloud image, no modification, no kexec, no GRUB — pure UEFI
+hand-off all the way to the login prompt.
+
+### Why it matters
+
+Apple Virtualization.framework on arm64 silently traps Linux's
+`kexec_file_load` (the EL1 jump after MMU-off; the kernel never
+returns, the VM hangs). The existing cloud-boot `init/` pipeline
+relies on that path: it boots a tiny initrd first, runs in
+userspace, then kexecs into the real distro kernel — and that's
+exactly what Apple VZ breaks.
+
+Phase 5d sidesteps that entirely. The production loader stays
+inside Boot Services context throughout, then hands off to the
+distro kernel's *own* EFI stub via `LoadImage` + `StartImage` (the
+same path every UEFI machine uses for first boot). The stub calls
+`ExitBootServices` itself — a code path Apple VZ supports, since
+that's what every distro installer needs.
+
+### Code layout
+
+The ext4 driver lives in
+[`cmd/efi-loader/ext4.go`](cmd/efi-loader/ext4.go) (~700 lines).
+It carries:
+
+- `efiBlockIO` / `efiBlockIOMedia` + `EFI_BLOCK_IO_PROTOCOL_GUID`.
+- ext4 superblock + group descriptor + auth-and-non-auth inode
+  parsers.
+- `readDataBlock` (depth-0 extents) and `readFile` (depth-0 + 1) —
+  enough for any single file under ~5 GiB on 4 KiB blocks.
+- `findInDir` / `findInDirPrefix` walking ext4_dir_entry_2
+  records.
+- `EFI_LOAD_FILE2_PROTOCOL` instance + `goLoadFile2` callback +
+  `installInitrdProtocol`.
+- `tryCloudDiskBoot` orchestrator that `_start` calls when the
+  FAT-volume UKI search returns nothing.
+
+The Phase-5d scaffolding lives in `cmd/disk-probe/` — same code
+path, but as a standalone diagnostic binary with verbose output
+for each step (see its commit history for the step-by-step
+bring-up against the Debian image).
 
 ## Reproduce
 
