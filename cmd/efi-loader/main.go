@@ -254,6 +254,16 @@ var cmdlineVarName = [...]uint16{
 	0,
 }
 
+// "CloudBootTarget" — UTF-16LE, NUL-terminated. Picks which UKI under
+// \EFI\Linux\ the loader chain-loads; e.g. CloudBootTarget="rescue"
+// → \EFI\Linux\rescue.efi. Falls back to "cloud-boot" (= the
+// historical Phase-5a default) when the variable is missing or
+// references a non-existent file on every volume.
+var targetVarName = [...]uint16{
+	'C', 'l', 'o', 'u', 'd', 'B', 'o', 'o', 't', 'T', 'a', 'r', 'g', 'e', 't',
+	0,
+}
+
 // ----- asm thunks (defined in thunk-arm64.S / thunk-amd64.S) -----
 
 //go:linkname efiCall1 efiCall1
@@ -345,16 +355,21 @@ var (
 	// LoadImage → child handle.
 	childImageHandle uintptr
 
-	// Canonical UKI path. UEFI requires backslash separators and
-	// UTF-16LE. Pre-encoded so we don't allocate at runtime.
+	// UKI path buffer. Built at boot time from "\EFI\Linux\" +
+	// CloudBootTarget (or "cloud-boot" default) + ".efi" + NUL. UEFI
+	// requires backslash separators and UTF-16LE encoding.
 	//
-	// "\EFI\Linux\cloud-boot.efi"
-	ukiPath = [...]uint16{
-		'\\', 'E', 'F', 'I',
-		'\\', 'L', 'i', 'n', 'u', 'x',
-		'\\', 'c', 'l', 'o', 'u', 'd', '-', 'b', 'o', 'o', 't', '.', 'e', 'f', 'i',
-		0,
-	}
+	// Sized for a 64-char target name; total = 11 prefix chars + 64
+	// target chars + 4 suffix chars + NUL = 80 — round up to 128 for
+	// headroom.
+	ukiPath [128]uint16
+
+	// Target name buffer (ASCII, NUL-terminated). Populated by
+	// readTargetEFIVar from `CloudBootTarget` UEFI variable, or left
+	// as "cloud-boot" default.
+	targetRaw     [64]byte
+	targetRawLen  uintptr
+	defaultTarget = [...]byte{'c', 'l', 'o', 'u', 'd', '-', 'b', 'o', 'o', 't'}
 
 	// Cmdline source path. ASCII bytes, one line, trailing newline
 	// tolerated. "\cmdline" at the FAT root — same convention
@@ -392,6 +407,77 @@ var (
 	// reach runtime.alloc → VirtualAlloc and crash here.
 	scratchSize uintptr
 )
+
+// readTargetEFIVar fetches the host-staged UKI target name from the
+// `CloudBootTarget` UEFI variable. The value is plain ASCII (no NUL
+// terminator required) naming the UKI under `\EFI\Linux\<target>.efi`.
+// Returns true if a non-empty target was read; populates targetRaw /
+// targetRawLen. On any failure the caller falls back to the
+// `cloud-boot` default.
+func readTargetEFIVar(co *efiSimpleTextOutput, rt *efiRuntimeServices) bool {
+	if rt == nil || rt.getVariable == 0 {
+		return false
+	}
+	scratchSize = uintptr(len(targetRaw))
+	st := efiCall5(rt.getVariable,
+		uintptr(unsafe.Pointer(&targetVarName[0])),
+		uintptr(unsafe.Pointer(&cloudBootGUID)),
+		0,
+		uintptr(unsafe.Pointer(&scratchSize)),
+		uintptr(unsafe.Pointer(&targetRaw[0])))
+	if st != efiSuccess || scratchSize == 0 {
+		return false
+	}
+	// Trim trailing whitespace / NUL / CR / LF.
+	for scratchSize > 0 {
+		b := targetRaw[scratchSize-1]
+		if b != '\r' && b != '\n' && b != ' ' && b != '\t' && b != 0 {
+			break
+		}
+		scratchSize--
+	}
+	if scratchSize == 0 {
+		return false
+	}
+	targetRawLen = scratchSize
+	writeASCII(co, "  target from EFI var CloudBootTarget: ")
+	for i := uintptr(0); i < targetRawLen; i++ {
+		oneCharBuf[0] = targetRaw[i]
+		writeASCII(co, oneCharStr)
+	}
+	writeASCII(co, "\r\n")
+	return true
+}
+
+// buildUKIPath constructs the UTF-16LE path "\EFI\Linux\<target>.efi"
+// in `ukiPath`, NUL-terminated. If targetRawLen is zero, "cloud-boot"
+// is used as the target name (Phase-5a default).
+func buildUKIPath() {
+	const prefix = "\\EFI\\Linux\\"
+	const suffix = ".efi"
+
+	off := 0
+	for i := 0; i < len(prefix); i++ {
+		ukiPath[off] = uint16(prefix[i])
+		off++
+	}
+	if targetRawLen == 0 {
+		for i := 0; i < len(defaultTarget); i++ {
+			ukiPath[off] = uint16(defaultTarget[i])
+			off++
+		}
+	} else {
+		for i := uintptr(0); i < targetRawLen && off < len(ukiPath)-len(suffix)-1; i++ {
+			ukiPath[off] = uint16(targetRaw[i])
+			off++
+		}
+	}
+	for i := 0; i < len(suffix); i++ {
+		ukiPath[off] = uint16(suffix[i])
+		off++
+	}
+	ukiPath[off] = 0
+}
 
 // readCmdlineEFIVar fetches the host-staged cmdline from the
 // `CloudBootCmdline` UEFI variable under the cloud-boot vendor GUID.
@@ -627,7 +713,28 @@ func patchChildCmdline(co *efiSimpleTextOutput, bs *efiBootServices, childHandle
 	writeASCII(co, " bytes)\r\n")
 }
 
-// tryLoadFromHandle attempts to chain-load `\EFI\Linux\cloud-boot.efi`
+// tryAllHandles walks every SimpleFileSystem handle in sfsHandleBuf
+// and tries to load the UKI currently encoded in ukiPath from each
+// one. Returns true on the first successful LoadImage. The caller is
+// responsible for StartImage; this helper just locates and prepares
+// the child image.
+func tryAllHandles(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle uintptr) bool {
+	writeASCII(co, "  trying UKI ")
+	for i := 0; ukiPath[i] != 0 && i < len(ukiPath); i++ {
+		oneCharBuf[0] = byte(ukiPath[i])
+		writeASCII(co, oneCharStr)
+	}
+	writeASCII(co, "\r\n")
+	for i := uintptr(0); i < sfsHandleCount; i++ {
+		h := *(*uintptr)(unsafe.Pointer(sfsHandleBuf + i*unsafe.Sizeof(uintptr(0))))
+		if tryLoadFromHandle(co, bs, imageHandle, h) {
+			return true
+		}
+	}
+	return false
+}
+
+// tryLoadFromHandle attempts to chain-load the UKI named by ukiPath
 // from the SimpleFileSystem on `sfsHandle`. Returns true if LoadImage
 // succeeded — the caller must then StartImage. False means the file
 // wasn't found here (try the next handle) or an error occurred. All
@@ -790,7 +897,7 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	bs := st.bootServices
 	rt := st.runtimeServices
 
-	writeASCII(co, "cloud-boot/loader — disk-mode (phase 5b)\r\n")
+	writeASCII(co, "cloud-boot/loader — disk-mode (phase 5b/5c)\r\n")
 
 	// Try the EFI-variable cmdline first. If the host staged
 	// `CloudBootCmdline` under cloudBootGUID via efivar-stage, it
@@ -801,6 +908,13 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	if readCmdlineEFIVar(co, bs, rt) {
 		writeASCII(co, "cmdline source: EFI variable\r\n")
 	}
+
+	// Resolve target UKI from CloudBootTarget (or fall back to the
+	// "cloud-boot" default). Builds the full \EFI\Linux\<target>.efi
+	// path in ukiPath.
+	targetRawLen = 0
+	readTargetEFIVar(co, rt)
+	buildUKIPath()
 
 	// Step 1: enumerate every SimpleFileSystem handle. ByProtocol
 	// search (SearchType=2) plus the EFI_SIMPLE_FILE_SYSTEM GUID
@@ -825,20 +939,18 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	writeHex64(co, uint64(sfsHandleCount))
 	writeASCII(co, "\r\n")
 
-	// Step 2: try each volume until one yields the UKI. First hit wins.
-	loaded := false
-	for i := uintptr(0); i < sfsHandleCount; i++ {
-		h := *(*uintptr)(unsafe.Pointer(sfsHandleBuf + i*unsafe.Sizeof(uintptr(0))))
-		writeASCII(co, "  trying SFS handle ")
-		writeHex64(co, uint64(h))
-		writeASCII(co, "\r\n")
-		if tryLoadFromHandle(co, bs, imageHandle, h) {
-			loaded = true
-			break
-		}
+	// Step 2: try each volume for the resolved target. If a custom
+	// target was set via CloudBootTarget and it isn't on any volume,
+	// fall back to the "cloud-boot" default before giving up.
+	loaded := tryAllHandles(co, bs, imageHandle)
+	if !loaded && targetRawLen > 0 {
+		writeASCII(co, "  target UKI not found, falling back to cloud-boot.efi\r\n")
+		targetRawLen = 0
+		buildUKIPath()
+		loaded = tryAllHandles(co, bs, imageHandle)
 	}
 	if !loaded {
-		writeASCII(co, "no UKI found at \\EFI\\Linux\\cloud-boot.efi on any volume\r\n")
+		writeASCII(co, "no UKI found on any volume\r\n")
 		for {
 		}
 	}

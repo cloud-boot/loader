@@ -1,16 +1,27 @@
-// efivar-stage writes a `CloudBootCmdline` UEFI variable into an
+// efivar-stage writes cloud-boot UEFI variables into an
 // OVMF_VARS.fd / QEMU_VARS.fd binary store BEFORE QEMU is launched.
-// The loader's `readCmdlineEFIVar` reads it back via
-// RuntimeServices.GetVariable and propagates it into the chained
-// kernel's LoadOptions.
+//
+// Two variables are recognised:
+//
+//	CloudBootCmdline (-cmdline …)
+//	    Kernel command line. The disk-mode loader's readCmdlineEFIVar
+//	    reads it back via RuntimeServices.GetVariable and propagates
+//	    it into the chained image's LoadedImage.LoadOptions.
+//
+//	CloudBootTarget (-target …)
+//	    UKI basename under \EFI\Linux\. Selects which UKI the loader
+//	    chain-loads — e.g. -target rescue → \EFI\Linux\rescue.efi.
+//	    Absent → defaults to "cloud-boot" (the Phase-5a default).
 //
 // Goes through github.com/go-filesystems/uefi (host-side, offline
-// NvVar parser/writer), so no QEMU monitor commands and no boot-
-// time UEFI shell interaction is needed.
+// NvVar parser/writer), so no QEMU monitor commands and no boot-time
+// UEFI shell interaction is needed.
 //
 // Usage:
 //
-//	efivar-stage -store OVMF_VARS.fd -cmdline "console=ttyAMA0 root=…"
+//	efivar-stage -store OVMF_VARS.fd \
+//	    -cmdline "console=ttyAMA0 root=LABEL=…" \
+//	    -target rescue
 package main
 
 import (
@@ -32,11 +43,20 @@ var cloudBootGUID = fsuefi.GUID{
 	0x9B, 0x76, 0x1F, 0x4C, 0x0E, 0x7A, 0x3B, 0x8E,
 }
 
+// NV|BS|RT — non-volatile so the variable persists across reboots,
+// readable from BootServices (the loader runs there), readable from
+// RuntimeServices (loaded kernel could also read it if it wanted to).
+// systemd-boot's LoaderEntries use the same flag combination.
+const attrs = fsuefi.AttrNonVolatile |
+	fsuefi.AttrBootServiceAccess |
+	fsuefi.AttrRuntimeAccess
+
 func main() {
 	var (
 		storePath = flag.String("store", "", "path to OVMF_VARS.fd / QEMU_VARS.fd")
-		cmdline   = flag.String("cmdline", "", "kernel command line to stage")
-		delete    = flag.Bool("delete", false, "delete CloudBootCmdline instead of writing it")
+		cmdline   = flag.String("cmdline", "", "kernel command line — staged as CloudBootCmdline")
+		target    = flag.String("target", "", "UKI basename under \\EFI\\Linux\\ — staged as CloudBootTarget")
+		delete    = flag.Bool("delete", false, "delete CloudBootCmdline + CloudBootTarget instead of writing")
 		arch      = flag.String("arch", "arm64", "OVMF flavor: arm64 (ArmVirt 768 KiB FV) | amd64 (x86_64 FV=sizeBytes)")
 	)
 	flag.Parse()
@@ -88,36 +108,47 @@ func main() {
 	defer store.Close()
 
 	if *delete {
-		if err := store.Delete("CloudBootCmdline", cloudBootGUID); err != nil {
-			fmt.Fprintf(os.Stderr, "efivar-stage: delete: %v\n", err)
-			os.Exit(1)
+		// Delete is best-effort per variable — a missing variable is
+		// not an error here; we want -delete to leave the store in a
+		// known-clean state regardless of what was previously staged.
+		for _, name := range []string{"CloudBootCmdline", "CloudBootTarget"} {
+			if err := store.Delete(name, cloudBootGUID); err != nil {
+				fmt.Fprintf(os.Stderr, "efivar-stage: delete %s: %v (continuing)\n", name, err)
+			} else {
+				fmt.Printf("deleted %s\n", name)
+			}
 		}
-		fmt.Println("deleted CloudBootCmdline")
 		return
 	}
 
-	if *cmdline == "" {
-		fmt.Fprintln(os.Stderr, "efivar-stage: -cmdline is required (use -delete to remove)")
+	if *cmdline == "" && *target == "" {
+		fmt.Fprintln(os.Stderr, "efivar-stage: at least one of -cmdline / -target is required (or use -delete)")
 		os.Exit(2)
 	}
 
-	// NV|BS|RT — non-volatile so the variable persists across reboots,
-	// readable from BootServices (the loader runs there), readable
-	// from RuntimeServices (loaded kernel could also read it if it
-	// wanted to). This is what systemd-boot uses for LoaderEntries.
-	const attrs = fsuefi.AttrNonVolatile |
-		fsuefi.AttrBootServiceAccess |
-		fsuefi.AttrRuntimeAccess
-
-	if err := store.Set(fsuefi.Variable{
-		Name:       "CloudBootCmdline",
-		GUID:       cloudBootGUID,
-		Attributes: attrs,
-		Data:       []byte(*cmdline),
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "efivar-stage: set: %v\n", err)
-		os.Exit(1)
+	if *cmdline != "" {
+		if err := store.Set(fsuefi.Variable{
+			Name:       "CloudBootCmdline",
+			GUID:       cloudBootGUID,
+			Attributes: attrs,
+			Data:       []byte(*cmdline),
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "efivar-stage: set CloudBootCmdline: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("staged CloudBootCmdline (%d bytes): %s\n", len(*cmdline), *cmdline)
 	}
 
-	fmt.Printf("staged CloudBootCmdline (%d bytes): %s\n", len(*cmdline), *cmdline)
+	if *target != "" {
+		if err := store.Set(fsuefi.Variable{
+			Name:       "CloudBootTarget",
+			GUID:       cloudBootGUID,
+			Attributes: attrs,
+			Data:       []byte(*target),
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "efivar-stage: set CloudBootTarget: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("staged CloudBootTarget (%d bytes): %s\n", len(*target), *target)
+	}
 }
