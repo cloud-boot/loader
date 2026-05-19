@@ -897,7 +897,7 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	bs := st.bootServices
 	rt := st.runtimeServices
 
-	writeASCII(co, "cloud-boot/loader — disk-mode (phase 5b/5c)\r\n")
+	writeASCII(co, "cloud-boot/loader — phase 5b/5c/5d\r\n")
 
 	// Try the EFI-variable cmdline first. If the host staged
 	// `CloudBootCmdline` under cloudBootGUID via efivar-stage, it
@@ -950,9 +950,21 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 		loaded = tryAllHandles(co, bs, imageHandle)
 	}
 	if !loaded {
-		writeASCII(co, "no UKI found on any volume\r\n")
-		for {
+		// Phase 5d fallback: walk BlockIO handles for an ext4
+		// partition whose /boot has vmlinuz-* + initrd.img-*. This
+		// is the cloud-disk path that boots a stock Linux
+		// distribution image (Debian / Ubuntu / Fedora …) without
+		// modification — same handoff as the FAT path (LoadImage +
+		// patchChildCmdline + StartImage) so the rest of _start
+		// runs unchanged.
+		writeASCII(co, "no UKI found, falling back to cloud-disk\r\n")
+		if !tryCloudDiskBoot(co, bs, imageHandle) {
+			writeASCII(co, "cloud-disk fallback failed\r\n")
+			for {
+			}
 		}
+		// childImageHandle is populated by tryCloudDiskBoot.
+		patchChildCmdline(co, bs, childImageHandle)
 	}
 
 	// Step 3: StartImage. On the happy path it never returns — the

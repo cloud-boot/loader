@@ -330,10 +330,42 @@ tasks:
         -drive if=virtio,format=qcow2,file=cloud-overlay.qcow2,id=cloud
         -nographic -serial mon:stdio
 
+  # qemu-loader-cloud-arm64: production loader vs an unmodified Debian
+  # cloud image. No UKI staged on the FAT ESP → loader falls through
+  # to the ext4 path and boots the kernel inside /boot of the cloud
+  # image's rootfs partition. CMDLINE defaults to "console=ttyAMA0
+  # root=LABEL=cloudimg-rootfs ro" — override to taste.
+  qemu-loader-cloud-arm64:
+    desc: Boot the loader against an unmodified Debian cloud image (no UKI staged → ext4 fallback).
+    deps: [loader-arm64, efivar-stage]
+    dir: cmd/efi-loader
+    preconditions:
+      - sh: 'test -f "{{.DEBIAN_RAW}}"'
+        msg: 'Debian cloud image missing — run `ARCH=arm64 task -t ../../uki/Taskfile.yaml label:debian:cloud` first.'
+    vars:
+      CMDLINE: '{{.CMDLINE | default "console=ttyAMA0 root=LABEL=cloudimg-rootfs ro"}}'
+    cmds:
+      - rm -f esp.img ovmf_vars_arm64.fd cloud-overlay.qcow2
+      - dd if=/dev/zero of=ovmf_vars_arm64.fd bs=1M count=64 status=none
+      - dd if=/dev/zero of=esp.img bs=1M count=64 status=none
+      - "mformat -i esp.img -F ::"
+      - "mmd -i esp.img ::EFI ::EFI/BOOT"
+      - "mcopy -i esp.img {{.LOADER_ARM64_OUT}} ::EFI/BOOT/BOOTAA64.EFI"
+      - ../efivar-stage/efivar-stage -store ovmf_vars_arm64.fd -cmdline "{{.CMDLINE}}"
+      - qemu-img create -f qcow2 -F raw -b {{.DEBIAN_RAW}} cloud-overlay.qcow2 > /dev/null
+      - >-
+        qemu-system-aarch64
+        -machine virt,gic-version=max,accel=hvf:tcg -cpu max -m 1024 -smp 2
+        -drive if=pflash,format=raw,readonly=on,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd
+        -drive if=pflash,format=raw,file=ovmf_vars_arm64.fd
+        -drive if=virtio,format=raw,file=esp.img,id=esp
+        -drive if=virtio,format=qcow2,file=cloud-overlay.qcow2,id=cloud
+        -nographic -serial mon:stdio
+
   clean:
     cmds:
       - rm -f cmd/efi-probe/*.o cmd/efi-probe/*.EFI cmd/efi-probe/esp.img cmd/efi-probe/ovmf_vars_arm64.fd
       - rm -f cmd/disk-probe/*.o cmd/disk-probe/*.EFI cmd/disk-probe/esp.img cmd/disk-probe/ovmf_vars_arm64.fd cmd/disk-probe/cloud-overlay.qcow2
-      - rm -f cmd/efi-loader/*.o cmd/efi-loader/*.EFI cmd/efi-loader/esp.img cmd/efi-loader/ovmf_vars_arm64.fd
+      - rm -f cmd/efi-loader/*.o cmd/efi-loader/*.EFI cmd/efi-loader/esp.img cmd/efi-loader/ovmf_vars_arm64.fd cmd/efi-loader/cloud-overlay.qcow2
       - rm -rf cmd/efi-loader/esp-stage cmd/efi-loader/esp-loader.iso
       - rm -f cmd/efivar-stage/efivar-stage
