@@ -9,6 +9,7 @@
 # Linker map and ESP images produced by the qemu-probe-* tasks.
 *.map
 esp.img
+esp64.img
 esp-stub.img
 esp-*/
 
