@@ -20,5 +20,8 @@ nvram.bin
 # Host-side build outputs (Go binaries, not EFI).
 cmd/efivar-stage/efivar-stage
 
+# qcow2 overlays created by qemu-{loader,disk-probe}-cloud-arm64.
+cloud-overlay.qcow2
+
 # Taskfile run-state.
 .task/
