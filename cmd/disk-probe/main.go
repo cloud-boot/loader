@@ -1624,6 +1624,16 @@ var (
 	// Working area for the most-recently-read xfs inode. xfs inode
 	// size is 256 (legacy) or 512 (v5 default); 512 covers both.
 	xfsInodeBuf [512]byte
+
+	// Set by tryXfsCloudBoot once a kernel has been LoadImage'd —
+	// stops the BlockIO-handle loop from trying a second xfs
+	// partition after the first one wins.
+	xfsBooted bool
+
+	// Diagnostic toggle: when true, tryXfsCloudBoot skips the
+	// initrd lookup + LoadFile2 install. Useful for isolating
+	// crashes in InstallProtocolInterface from the LoadImage path.
+	xfsSkipInitrd = false
 )
 
 // ----- xfs inode -----
@@ -1988,6 +1998,331 @@ func readXfsFile(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
 	return ino.size
 }
 
+// tryXfsCloudBoot is the xfs counterpart to readKernel + readInitrd
+// + chainKernel for ext4: walk the partition's root dir for
+// vmlinuz-* and initramfs-* (or initrd-*), AllocatePool the right
+// sizes, read both files via readXfsFile, install LoadFile2 for the
+// initrd, then LoadImage the kernel.
+//
+// Returns true if a kernel was loaded and StartImage'd. Sets
+// xfsBooted so the outer BlockIO loop stops trying further
+// partitions.
+//
+// AlmaLinux/RHEL put kernel+initrd at the *root* of a dedicated
+// /boot xfs partition. So unlike the Debian case there's no
+// "/boot/" prefix here — we scan the partition's root directly.
+func tryXfsCloudBoot(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle,
+	bio uintptr, mediaId, devBlkSz uint32, sb *xfsSB,
+) bool {
+	writeASCII(co, "  tryXfsCloudBoot: bio=")
+	writeHex64(co, uint64(bio))
+	writeASCII(co, " rootIno=")
+	writeDec(co, sb.rootIno)
+	writeASCII(co, "\r\n")
+	// Find vmlinuz-* in the root.
+	kIno, kOK := findInXfsDirPrefix(co, bio, mediaId, devBlkSz, sb,
+		sb.rootIno, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
+	writeASCII(co, "  findInXfsDirPrefix returned, kOK=")
+	if kOK {
+		writeASCII(co, "true\r\n")
+	} else {
+		writeASCII(co, "false\r\n")
+	}
+	if !kOK {
+		// Not a /boot partition (no vmlinuz at its root) — skip.
+		return false
+	}
+	writeASCII(co, "  xfs kernel: ")
+	for i := 0; i < kernelNameLen; i++ {
+		oneCharBuf[0] = kernelName[i]
+		writeASCII(co, oneCharStr)
+	}
+	writeASCII(co, " (inode=")
+	writeDec(co, kIno)
+	writeASCII(co, ")\r\n")
+
+	// Read kernel inode to learn its size.
+	if !readXfsInode(co, bio, mediaId, devBlkSz, sb, kIno) {
+		return false
+	}
+	var ino xfsInode
+	if !parseXfsInode(xfsInodeBuf[:], &ino) {
+		return false
+	}
+	writeASCII(co, "    kernel size = ")
+	writeDec(co, ino.size)
+	writeASCII(co, " bytes (nextents=")
+	writeDec(co, uint64(ino.nextents))
+	writeASCII(co, ")\r\n")
+
+	kernelBufPtr = 0
+	if efiCall3(bs.allocatePool, efiLoaderData, uintptr(ino.size),
+		uintptr(unsafe.Pointer(&kernelBufPtr))) != efiSuccess || kernelBufPtr == 0 {
+		writeASCII(co, "    AllocatePool(kernel) failed\r\n")
+		return false
+	}
+	writeASCII(co, "    kernelBufPtr=")
+	writeHex64(co, uint64(kernelBufPtr))
+	writeASCII(co, "\r\n")
+	got := readXfsFile(co, bio, mediaId, devBlkSz, sb, kIno, kernelBufPtr, ino.size)
+	if got != ino.size {
+		writeASCII(co, "    short kernel read\r\n")
+		return false
+	}
+	loadedKernelSize = got
+	writeASCII(co, "    readXfsFile(kernel) OK, ")
+	writeDec(co, got)
+	writeASCII(co, " bytes\r\n")
+
+	// Find an initrd. RHEL ships initramfs-*; Debian uses
+	// initrd.img-*. Try the RHEL convention first; fall back to the
+	// Debian one — same disk-probe binary works for both
+	// distributions.
+	var iIno uint64
+	var iOK bool
+	if !xfsSkipInitrd {
+		iIno, iOK = findInXfsDirPrefix(co, bio, mediaId, devBlkSz, sb,
+			sb.rootIno, initramfsPrefix[:], &initrdName, &initrdNameLen)
+		if !iOK {
+			iIno, iOK = findInXfsDirPrefix(co, bio, mediaId, devBlkSz, sb,
+				sb.rootIno, initrdPrefix[:], &initrdName, &initrdNameLen)
+		}
+	}
+	if !iOK {
+		writeASCII(co, "    no initramfs-*/initrd-* in root — continuing without initrd\r\n")
+	} else {
+		writeASCII(co, "  xfs initrd: ")
+		for i := 0; i < initrdNameLen; i++ {
+			oneCharBuf[0] = initrdName[i]
+			writeASCII(co, oneCharStr)
+		}
+		writeASCII(co, " (inode=")
+		writeDec(co, iIno)
+		writeASCII(co, ")\r\n")
+
+		if !readXfsInode(co, bio, mediaId, devBlkSz, sb, iIno) ||
+			!parseXfsInode(xfsInodeBuf[:], &ino) {
+			return false
+		}
+		initrdSize = ino.size
+		writeASCII(co, "    initrd size = ")
+		writeDec(co, initrdSize)
+		writeASCII(co, " bytes\r\n")
+
+		initrdDataPtr = 0
+		if efiCall3(bs.allocatePool, efiLoaderData, uintptr(initrdSize),
+			uintptr(unsafe.Pointer(&initrdDataPtr))) != efiSuccess || initrdDataPtr == 0 {
+			writeASCII(co, "    AllocatePool(initrd) failed\r\n")
+			return false
+		}
+		writeASCII(co, "    initrdDataPtr=")
+		writeHex64(co, uint64(initrdDataPtr))
+		writeASCII(co, "\r\n")
+		igot := readXfsFile(co, bio, mediaId, devBlkSz, sb, iIno, initrdDataPtr, initrdSize)
+		if igot != initrdSize {
+			writeASCII(co, "    short initrd read\r\n")
+			return false
+		}
+		if !installInitrdProtocol(co, bs) {
+			return false
+		}
+		writeASCII(co, "    initrd protocols installed\r\n")
+	}
+
+	chainKernel(co, bs, imageHandle, loadedKernelSize)
+	return true
+}
+
+// initramfsPrefix matches the RHEL-family convention (initramfs-*.img).
+var initramfsPrefix = [...]byte{'i', 'n', 'i', 't', 'r', 'a', 'm', 'f', 's', '-'}
+
+// findInXfsDirPrefix scans dirIno for the first entry whose name
+// starts with `prefix`. Returns the matching inode + full name on
+// success. Handles both short-form and block-form root dirs.
+//
+// Implemented WITHOUT closures: TinyGo's `gc: leaking` runtime
+// promotes captured variables to heap which under UEFI ends at
+// VirtualAlloc → instruction abort. So the dir walk lives inline
+// and the match result goes through package-scope vars.
+func findInXfsDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *xfsSB, dirIno uint64, prefix []byte,
+	outNameBuf *[255]byte, outNameLen *int,
+) (childIno uint64, found bool) {
+	writeASCII(co, "    findInXfsDirPrefix: reading inode\r\n")
+	if !readXfsInode(co, bio, mediaId, devBlkSz, sb, dirIno) {
+		writeASCII(co, "    readXfsInode failed\r\n")
+		return 0, false
+	}
+	writeASCII(co, "    readXfsInode OK, parsing\r\n")
+	var ino xfsInode
+	if !parseXfsInode(xfsInodeBuf[:], &ino) {
+		return 0, false
+	}
+	isV5 := ino.version >= 3
+	dfo := xfsDataForkOffset(ino.version)
+
+	switch ino.format {
+	case xfsFormatLocal:
+		if uint32(len(xfsInodeBuf)) < dfo+uint32(ino.size) {
+			return 0, false
+		}
+		return findInXfsShortForm(xfsInodeBuf[dfo:dfo+uint32(ino.size)], isV5,
+			prefix, outNameBuf, outNameLen)
+	case xfsFormatExtents:
+		if ino.nextents == 0 {
+			return 0, false
+		}
+		var e xfsExtent
+		if !parseXfsExtent(xfsInodeBuf[dfo:dfo+16], &e) {
+			return 0, false
+		}
+		byteOff := fsbToByteOff(e.startblock, sb)
+		lba := byteOff / uint64(devBlkSz)
+		for k := 0; k < len(dirBuf); k++ {
+			dirBuf[k] = 0
+		}
+		if readBlocks(bio, mediaId, lba, uintptr(sb.blockSize),
+			uintptr(unsafe.Pointer(&dirBuf[0]))) != efiSuccess {
+			return 0, false
+		}
+		return findInXfsBlockForm(dirBuf[:], sb.blockSize, isV5,
+			prefix, outNameBuf, outNameLen)
+	}
+	_ = co
+	return 0, false
+}
+
+// findInXfsShortForm — closure-free prefix search through a
+// short-form (inline) dir blob.
+func findInXfsShortForm(sfData []byte, isV5 bool, prefix []byte,
+	outNameBuf *[255]byte, outNameLen *int,
+) (uint64, bool) {
+	if len(sfData) < 2 {
+		return 0, false
+	}
+	count := uint32(sfData[0])
+	i8count := uint32(sfData[1])
+	use8 := i8count > 0
+	inumLen := uint32(4)
+	if use8 {
+		inumLen = 8
+	}
+	off := uint32(2 + inumLen)
+	for i := uint32(0); i < count; i++ {
+		if uint32(len(sfData)) < off+3 {
+			return 0, false
+		}
+		namelen := uint32(sfData[off])
+		off++
+		off += 2
+		if uint32(len(sfData)) < off+namelen+inumLen {
+			return 0, false
+		}
+		name := sfData[off : off+namelen]
+		off += namelen
+		if isV5 {
+			off++ // ftype
+		}
+		var inumber uint64
+		if use8 {
+			inumber = be64(sfData[off:])
+		} else {
+			inumber = uint64(be32(sfData[off:]))
+		}
+		off += inumLen
+		if uint32(len(name)) >= uint32(len(prefix)) {
+			ok := true
+			for j := 0; j < len(prefix); j++ {
+				if name[j] != prefix[j] {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				n := len(name)
+				if n > len(outNameBuf) {
+					n = len(outNameBuf)
+				}
+				for j := 0; j < n; j++ {
+					outNameBuf[j] = name[j]
+				}
+				*outNameLen = n
+				return inumber, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// findInXfsBlockForm — closure-free prefix search through a
+// single-block dir's data area.
+func findInXfsBlockForm(block []byte, blockSize uint32, isV5 bool, prefix []byte,
+	outNameBuf *[255]byte, outNameLen *int,
+) (uint64, bool) {
+	if uint32(len(block)) < blockSize {
+		return 0, false
+	}
+	magic := be32(block[0:])
+	if magic != xfsDir3BlockMagic && magic != xfsDir2BlockMagic {
+		return 0, false
+	}
+	hdrSize := uint32(xfsDir3HdrSize)
+	if !isV5 || magic == xfsDir2BlockMagic {
+		hdrSize = xfsDir2HdrSize
+	}
+	tailOff := blockSize - 8
+	leafCount := be32(block[tailOff:])
+	leafStart := tailOff - leafCount*8
+
+	off := hdrSize
+	for off+8 < leafStart {
+		first2 := be16(block[off:])
+		if first2 == 0xFFFF {
+			length := uint32(be16(block[off+2:]))
+			if length < 6 {
+				return 0, false
+			}
+			off += length
+			continue
+		}
+		inumber := be64(block[off:])
+		namelen := uint32(block[off+8])
+		if namelen == 0 || off+9+namelen > leafStart {
+			return 0, false
+		}
+		name := block[off+9 : off+9+namelen]
+		var recLen uint32
+		if isV5 {
+			recLen = 8 + 1 + namelen + 1 + 2
+		} else {
+			recLen = 8 + 1 + namelen + 2
+		}
+		recLen = (recLen + 7) &^ 7
+		if uint32(len(name)) >= uint32(len(prefix)) {
+			ok := true
+			for j := 0; j < len(prefix); j++ {
+				if name[j] != prefix[j] {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				n := int(namelen)
+				if n > len(outNameBuf) {
+					n = len(outNameBuf)
+				}
+				for j := 0; j < n; j++ {
+					outNameBuf[j] = name[j]
+				}
+				*outNameLen = n
+				return inumber, true
+			}
+		}
+		off += recLen
+	}
+	return 0, false
+}
+
 // listXfsRoot prints all entries in a partition's root directory.
 // Diagnostic for the bring-up — handles both short-form (format=1,
 // inline in inode) and block-form (format=2 with nextents=1, a
@@ -2283,19 +2618,9 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 		lastMediaId = media.mediaId
 		lastDevBlkSz = media.blockSize
 		detectFilesystem(co, probeBuf[:])
-		if lastXfsSBValid {
-			if readXfsInode(co, lastBIO, lastMediaId, lastDevBlkSz, &lastXfsSB, lastXfsSB.rootIno) {
-				var rino xfsInode
-				if parseXfsInode(xfsInodeBuf[:], &rino) {
-					printXfsInode(co, &rino)
-					writeASCII(co, "    root dir contents:\r\n")
-					listXfsRoot(co, lastBIO, lastMediaId, lastDevBlkSz, &lastXfsSB)
-				} else {
-					writeASCII(co, "    xfs root inode parse failed\r\n")
-				}
-			} else {
-				writeASCII(co, "    xfs root inode read failed\r\n")
-			}
+		if lastXfsSBValid && !xfsBooted {
+			xfsBooted = tryXfsCloudBoot(co, bs, imageHandle,
+				lastBIO, lastMediaId, lastDevBlkSz, &lastXfsSB)
 		}
 		if lastSBValid {
 			ext4InspectGroupDesc(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB)
