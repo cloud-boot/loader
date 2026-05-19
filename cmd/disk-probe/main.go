@@ -1860,6 +1860,134 @@ func btrfsLogicalToPhys(logical uint64) (uint64, bool) {
 	return 0, false
 }
 
+// ----- btrfs tree node layout -----
+//
+// Every tree block (leaf or interior node) starts with a 101-byte
+// btrfs_header:
+//
+//   0..32     csum
+//   32..48    fsid
+//   48..56    bytenr      (logical addr of this block — sanity check)
+//   56..64    flags
+//   64..80    chunk_tree_uuid
+//   80..88    generation
+//   88..96    owner       (tree id)
+//   96..100   nritems     (u32; items if leaf, key_ptrs if node)
+//   100       level       (0 = leaf, >0 = internal node)
+//
+// Leaf payload — array of btrfs_item (25 bytes each):
+//   key (17)  | offset (u32) | size (u32)
+//   The item's data sits at  blockStart + sizeof(header) + offset.
+//   "offset" is measured from the START of the LEAF DATA AREA,
+//   which begins right after the header (so item-data starts at
+//   blockStart + 101 + offset). [verified empirically against real
+//   btrfs nodes]
+//
+// Internal node payload — array of btrfs_key_ptr (33 bytes each):
+//   key (17) | blockptr (u64, logical) | generation (u64)
+
+const (
+	btrfsHeaderSize = 101
+	btrfsItemSize   = 25
+	btrfsKeyPtrSize = 33
+)
+
+// btrfsTreeBuf holds the most-recently-read tree block. 16 KiB
+// covers default nodesize (sb.nodesize) on cloud images.
+var btrfsTreeBuf [16384]byte
+
+// readBtrfsBlock reads `size` bytes from `physical` into out.
+// Wraps ReadBlocks with the partition's LBA arithmetic.
+func readBtrfsBlock(bio uintptr, mediaId, devBlkSz uint32, physical uint64, size uint32, out unsafe.Pointer) bool {
+	lba := physical / uint64(devBlkSz)
+	if physical%uint64(devBlkSz) != 0 {
+		return false
+	}
+	return readBlocks(bio, mediaId, lba, uintptr(size), uintptr(out)) == efiSuccess
+}
+
+// btrfsItem extracted from a leaf's item array.
+type btrfsItem struct {
+	objectid uint64
+	keyType  uint8
+	keyOff   uint64
+	dataOff  uint32 // relative to start of leaf-data area (= header end)
+	dataSize uint32
+}
+
+func parseBtrfsItem(b []byte, it *btrfsItem) bool {
+	if len(b) < btrfsItemSize {
+		return false
+	}
+	it.objectid = le64(b[0:])
+	it.keyType = b[8]
+	it.keyOff = le64(b[9:])
+	it.dataOff = le32(b[17:])
+	it.dataSize = le32(b[21:])
+	return true
+}
+
+// walkChunkTreeLeaf reads the leaf at `phys` and appends every
+// CHUNK_ITEM_KEY (objectid=256, type=228) record to chunkMap.
+// Only handles the level-0 case (chunk_root_level=0) — sufficient
+// for cloud images with one chunk-tree node.
+func walkChunkTreeLeaf(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	phys uint64, nodesize uint32,
+) bool {
+	if !readBtrfsBlock(bio, mediaId, devBlkSz, phys, nodesize,
+		unsafe.Pointer(&btrfsTreeBuf[0])) {
+		writeASCII(co, "    chunk-tree leaf read failed\r\n")
+		return false
+	}
+	// Sanity: bytenr at offset 48 should equal logical of the block.
+	// Skip strict check — we just want to walk items.
+	level := btrfsTreeBuf[100]
+	nritems := le32(btrfsTreeBuf[96:])
+	if level != 0 {
+		writeASCII(co, "    chunk-tree root is internal node (level=")
+		writeDec(co, uint64(level))
+		writeASCII(co, ") — multi-level walk not implemented yet\r\n")
+		return false
+	}
+	writeASCII(co, "    chunk-tree leaf: ")
+	writeDec(co, uint64(nritems))
+	writeASCII(co, " items\r\n")
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
+		if off+btrfsItemSize > nodesize {
+			break
+		}
+		var it btrfsItem
+		if !parseBtrfsItem(btrfsTreeBuf[off:off+btrfsItemSize], &it) {
+			break
+		}
+		if it.keyType != btrfsChunkItemKey {
+			continue
+		}
+		// Item data sits at btrfsHeaderSize + dataOff.
+		dataPos := uint32(btrfsHeaderSize) + it.dataOff
+		if dataPos+48 > nodesize {
+			break
+		}
+		length := le64(btrfsTreeBuf[dataPos:])
+		numStripes := le16(btrfsTreeBuf[dataPos+44:])
+		if numStripes == 0 || dataPos+48+uint32(numStripes)*32 > nodesize {
+			break
+		}
+		physical := le64(btrfsTreeBuf[dataPos+48+8:]) // stripe[0].offset
+		if chunkMapCount >= maxChunks {
+			writeASCII(co, "    chunkMap full, dropping later records\r\n")
+			break
+		}
+		chunkMap[chunkMapCount].logical = it.keyOff
+		chunkMap[chunkMapCount].length = length
+		chunkMap[chunkMapCount].physical = physical
+		chunkMap[chunkMapCount].numStripes = numStripes
+		chunkMapCount++
+	}
+	return true
+}
+
 // probeBtrfsPartition reads bytes 64 KiB..68 KiB of the partition,
 // checks for the btrfs magic at offset 64, and dumps the SB if found.
 func probeBtrfsPartition(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32) {
@@ -1916,6 +2044,25 @@ func probeBtrfsPartition(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz
 	writeASCII(co, "    chunkRootPhys=")
 	writeHex64(co, chunkRootPhys)
 	writeASCII(co, "\r\n")
+	// Walk the chunk tree's root leaf — extends chunkMap with every
+	// chunk record the filesystem owns.
+	walkChunkTreeLeaf(co, lastBIO, lastMediaId, lastDevBlkSz,
+		chunkRootPhys, lastBtrfsSB.nodesize)
+	writeASCII(co, "    chunkMap (full): ")
+	writeDec(co, uint64(chunkMapCount))
+	writeASCII(co, " chunks\r\n")
+	for i := 0; i < chunkMapCount; i++ {
+		c := &chunkMap[i]
+		writeASCII(co, "      [")
+		writeDec(co, uint64(i))
+		writeASCII(co, "] log=")
+		writeHex64(co, c.logical)
+		writeASCII(co, " len=")
+		writeHex64(co, c.length)
+		writeASCII(co, " phys=")
+		writeHex64(co, c.physical)
+		writeASCII(co, "\r\n")
+	}
 }
 
 // ----- xfs inode -----
