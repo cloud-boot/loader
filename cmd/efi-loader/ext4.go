@@ -704,18 +704,28 @@ func tryCloudDiskBoot(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle 
 	writeDec(co, cloudSB.blockSize)
 	writeASCII(co, "\r\n")
 
-	// Find /boot from root inode #2.
-	bootIno, _, ok := findInDir(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
-		2, bootDirName[:4])
-	if !ok {
-		writeASCII(co, "  /boot not found\r\n")
-		return false
-	}
-	// Find /boot/vmlinuz-* by prefix.
+	// Try /vmlinuz-* at the partition's root first — that's the
+	// Fedora / RHEL layout where /boot is a separate (ext4 or xfs)
+	// partition. If absent, fall back to /boot/vmlinuz-* — the
+	// Debian / Ubuntu / Alpine layout where /boot lives inside the
+	// rootfs. `kernelDir` records which inode actually holds the
+	// kernel so the initrd lookup below targets the same directory.
+	kernelDir := uint32(2)
 	kIno, _, kOK := findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
-		bootIno, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
+		2, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
 	if !kOK {
-		writeASCII(co, "  no vmlinuz-* in /boot\r\n")
+		bootIno, _, hasBoot := findInDir(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
+			2, bootDirName[:4])
+		if hasBoot {
+			kIno, _, kOK = findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
+				bootIno, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
+			if kOK {
+				kernelDir = bootIno
+			}
+		}
+	}
+	if !kOK {
+		writeASCII(co, "  no vmlinuz-* at / or /boot\r\n")
 		return false
 	}
 	writeASCII(co, "  kernel: ")
@@ -748,11 +758,21 @@ func tryCloudDiskBoot(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle 
 	}
 	loadedKernelSize = got
 
-	// Find + read initrd.
+	// Find + read initrd in the same directory the kernel came from.
+	// Try Debian "initrd.img-*" first, then RHEL "initramfs-*.img"
+	// so a single ext4 walker handles both /boot-style and
+	// dedicated-/boot-partition (Fedora) layouts.
 	iIno, _, iOK := findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
-		bootIno, initrdPrefix[:], &initrdName, &initrdNameLen)
+		kernelDir, initrdPrefix[:], &initrdName, &initrdNameLen)
 	if !iOK {
-		writeASCII(co, "  no initrd.img-* in /boot — continuing without\r\n")
+		// initramfsPrefix is defined in xfs.go (RHEL family
+		// convention) — share it so the ext4 walker also matches
+		// Fedora-style /boot/initramfs-*.img.
+		iIno, _, iOK = findInDirPrefix(co, cloudBIO, cloudMediaId, cloudDevBlkSz, &cloudSB,
+			kernelDir, initramfsPrefix[:], &initrdName, &initrdNameLen)
+	}
+	if !iOK {
+		writeASCII(co, "  no initrd alongside kernel — continuing without\r\n")
 	} else {
 		writeASCII(co, "  initrd: ")
 		for i := 0; i < initrdNameLen; i++ {

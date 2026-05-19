@@ -18,6 +18,7 @@ vars:
   ARM64_TARGET:         targets/uefi-arm64.json
   DEBIAN_RAW:           '{{.TASKFILE_DIR}}/../uki/.debian-cache/trixie/arm64/genericcloud.labeled.raw'
   ALMA_RAW:             '{{.TASKFILE_DIR}}/../uki/.alma-cache/9/arm64/genericcloud.raw'
+  FEDORA_RAW:           '{{.TASKFILE_DIR}}/../uki/.fedora-cache/41/arm64/genericcloud.raw'
 
 tasks:
 
@@ -355,6 +356,37 @@ tasks:
       - "mcopy -i esp.img {{.LOADER_ARM64_OUT}} ::EFI/BOOT/BOOTAA64.EFI"
       - ../efivar-stage/efivar-stage -store ovmf_vars_arm64.fd -cmdline "{{.CMDLINE}}"
       - qemu-img create -f qcow2 -F raw -b {{.ALMA_RAW}} cloud-overlay.qcow2 > /dev/null
+      - >-
+        qemu-system-aarch64
+        -machine virt,gic-version=max,accel=hvf:tcg -cpu max -m 2048 -smp 2
+        -drive if=pflash,format=raw,readonly=on,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd
+        -drive if=pflash,format=raw,file=ovmf_vars_arm64.fd
+        -drive if=virtio,format=raw,file=esp.img,id=esp
+        -drive if=virtio,format=qcow2,file=cloud-overlay.qcow2,id=cloud
+        -nographic -serial mon:stdio
+
+  # qemu-loader-fedora-arm64: production loader vs an unmodified
+  # Fedora 41 cloud image. Layout: ESP (FAT) + /boot (ext4, dedicated)
+  # + / (btrfs). The ext4 walker now also probes the partition's own
+  # root for vmlinuz-*, so a separate /boot partition Just Works.
+  qemu-loader-fedora-arm64:
+    desc: Boot the loader against an unmodified Fedora 41 arm64 cloud image.
+    deps: [loader-arm64, efivar-stage]
+    dir: cmd/efi-loader
+    preconditions:
+      - sh: 'test -f "{{.FEDORA_RAW}}"'
+        msg: 'Fedora cloud image missing — fetch it into ../uki/.fedora-cache/41/arm64/genericcloud.raw first.'
+    vars:
+      CMDLINE: '{{.CMDLINE | default "console=ttyAMA0 root=/dev/vda5 ro"}}'
+    cmds:
+      - rm -f esp.img ovmf_vars_arm64.fd cloud-overlay.qcow2
+      - dd if=/dev/zero of=ovmf_vars_arm64.fd bs=1M count=64 status=none
+      - dd if=/dev/zero of=esp.img bs=1M count=64 status=none
+      - "mformat -i esp.img -F ::"
+      - "mmd -i esp.img ::EFI ::EFI/BOOT"
+      - "mcopy -i esp.img {{.LOADER_ARM64_OUT}} ::EFI/BOOT/BOOTAA64.EFI"
+      - ../efivar-stage/efivar-stage -store ovmf_vars_arm64.fd -cmdline "{{.CMDLINE}}"
+      - qemu-img create -f qcow2 -F raw -b {{.FEDORA_RAW}} cloud-overlay.qcow2 > /dev/null
       - >-
         qemu-system-aarch64
         -machine virt,gic-version=max,accel=hvf:tcg -cpu max -m 2048 -smp 2
