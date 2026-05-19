@@ -958,12 +958,15 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 		// patchChildCmdline + StartImage) so the rest of _start
 		// runs unchanged.
 		writeASCII(co, "no UKI found, falling back to cloud-disk\r\n")
-		if !tryCloudDiskBoot(co, bs, imageHandle) {
+		// ext4 first (Debian / Ubuntu / Alpine — /boot inside rootfs).
+		// xfs second (RHEL / AlmaLinux / Rocky — separate /boot
+		// partition). Either populates childImageHandle.
+		if !tryCloudDiskBoot(co, bs, imageHandle) &&
+			!tryXfsCloudBoot(co, bs, imageHandle) {
 			writeASCII(co, "cloud-disk fallback failed\r\n")
 			for {
 			}
 		}
-		// childImageHandle is populated by tryCloudDiskBoot.
 		patchChildCmdline(co, bs, childImageHandle)
 	}
 
