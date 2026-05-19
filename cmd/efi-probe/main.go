@@ -895,12 +895,72 @@ func probe(co *efiSimpleTextOutput, bs *efiBootServices, name string, guid *efiG
 	}
 }
 
+// efiLoadedImageProtocol — only the LoadOptions slot+size matter here.
+// Layout per UEFI 2.10 §9.1; see loader/cmd/efi-loader/main.go for the
+// full picture.
+type efiLoadedImageProtocol struct {
+	revision        uint32
+	_pad            uint32
+	parentHandle    uintptr
+	systemTable     uintptr
+	deviceHandle    uintptr
+	filePath        uintptr
+	_reserved       uintptr
+	loadOptionsSize uint32
+	_pad2           uint32
+	loadOptions     uintptr
+	// rest unused
+}
+
+// EFI_LOADED_IMAGE_PROTOCOL_GUID — 5b1b31a1-9562-11d2-8e3f-00a0c969723b
+var loadedImageGUID = efiGUID{
+	0xA1, 0x31, 0x1B, 0x5B,
+	0x62, 0x95,
+	0xD2, 0x11,
+	0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B,
+}
+
+var probeLIPHolder uintptr
+
 //go:export _start
 func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	co := st.conOut
 	bs := st.bootServices
 
 	writeASCII(co, "cloud-boot/loader probe — phase 0\r\n")
+
+	// Echo the LoadOptions we received from whatever loaded us. When
+	// this probe is chain-loaded by the disk-mode loader, the loader's
+	// patchChildCmdline path will have stuffed the staged
+	// CloudBootCmdline value into our LoadedImage.LoadOptions; echoing
+	// it back closes the end-to-end loop.
+	probeLIPHolder = 0
+	if efiCall3(bs.handleProtocol, imageHandle,
+		uintptr(unsafe.Pointer(&loadedImageGUID)),
+		uintptr(unsafe.Pointer(&probeLIPHolder))) == efiSuccess && probeLIPHolder != 0 {
+		lip := (*efiLoadedImageProtocol)(unsafe.Pointer(probeLIPHolder))
+		writeASCII(co, "  LoadOptionsSize = ")
+		writeHex64(co, uint64(lip.loadOptionsSize))
+		writeASCII(co, "\r\n  LoadOptions = ")
+		// Walk the UTF-16LE buffer back into ASCII for display.
+		// Stop at NUL or after loadOptionsSize/2 chars.
+		if lip.loadOptionsSize > 0 && lip.loadOptions != 0 {
+			limit := lip.loadOptionsSize / 2
+			for i := uint32(0); i < limit; i++ {
+				c := *(*uint16)(unsafe.Pointer(lip.loadOptions + uintptr(i)*2))
+				if c == 0 {
+					break
+				}
+				b := byte(c)
+				if b < 0x20 || b > 0x7E {
+					b = '.'
+				}
+				oneCharBuf[0] = b
+				writeASCII(co, oneCharStr)
+			}
+		}
+		writeASCII(co, "\r\n")
+	}
 
 	// Bind the network driver stack. OVMF auto-connects the network
 	// protocol layers (SNP → MNP → ARP → IP4 → TCP4/UDP4 → HTTP/DNS)
