@@ -929,6 +929,110 @@ func readFile(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
 	return fileSize
 }
 
+// efiLoadedImageProtocol — only the LoadOptions slots matter; we
+// patch them post-LoadImage so the chained kernel sees our cmdline.
+// Layout per UEFI 2.10 §9.1 (mirrors loader/cmd/efi-loader's copy).
+type efiLoadedImageProtocol struct {
+	revision        uint32
+	_pad            uint32
+	parentHandle    uintptr
+	systemTable     uintptr
+	deviceHandle    uintptr
+	filePath        uintptr
+	_reserved       uintptr
+	loadOptionsSize uint32
+	_pad2           uint32
+	loadOptions     uintptr
+	imageBase       uintptr
+	imageSize       uint64
+	imageCodeType   uint32
+	imageDataType   uint32
+	unload          uintptr
+}
+
+// EFI_LOADED_IMAGE_PROTOCOL_GUID — 5b1b31a1-9562-11d2-8e3f-00a0c969723b
+var loadedImageGUID = efiGUID{
+	0xA1, 0x31, 0x1B, 0x5B,
+	0x62, 0x95,
+	0xD2, 0x11,
+	0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B,
+}
+
+// Hard-coded bring-up cmdline: serial console + label-based root.
+// Once the loader proper inherits this code path, the cmdline comes
+// from the CloudBootCmdline UEFI variable (Phase 5b).
+//
+// "console=ttyAMA0 root=LABEL=cloudimg-rootfs ro\0" as UTF-16LE.
+var cmdlineUTF16 = [...]uint16{
+	'c', 'o', 'n', 's', 'o', 'l', 'e', '=', 't', 't', 'y', 'A', 'M', 'A', '0', ' ',
+	'r', 'o', 'o', 't', '=', 'L', 'A', 'B', 'E', 'L', '=',
+	'c', 'l', 'o', 'u', 'd', 'i', 'm', 'g', '-', 'r', 'o', 'o', 't', 'f', 's', ' ',
+	'r', 'o',
+	0,
+}
+
+var (
+	kernelImageHandle uintptr
+	kernelLIPHolder   uintptr
+
+	// Filled by readKernel right after a successful readFile so the
+	// caller (here: _start) can pass the exact byte count to LoadImage
+	// without re-parsing the inode.
+	loadedKernelSize uint64
+)
+
+// chainKernel LoadImages the kernel buffer, patches LoadOptions,
+// then StartImages it. On the happy path control never returns; on
+// failure we report the status and idle.
+func chainKernel(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle uintptr, size uint64) {
+	kernelImageHandle = 0
+	st := efiCall6(bs.loadImage,
+		0,                                              // BootPolicy = FALSE
+		imageHandle,                                    // ParentImageHandle
+		0,                                              // DevicePath = NULL
+		kernelBufPtr,                                   // SourceBuffer
+		uintptr(size),                                  // SourceSize
+		uintptr(unsafe.Pointer(&kernelImageHandle)))
+	if st != efiSuccess {
+		writeASCII(co, "    LoadImage failed: ")
+		writeHex64(co, st)
+		writeASCII(co, "\r\n")
+		return
+	}
+	writeASCII(co, "    LoadImage OK, child=")
+	writeHex64(co, uint64(kernelImageHandle))
+	writeASCII(co, "\r\n")
+
+	kernelLIPHolder = 0
+	st = efiCall3(bs.handleProtocol,
+		kernelImageHandle,
+		uintptr(unsafe.Pointer(&loadedImageGUID)),
+		uintptr(unsafe.Pointer(&kernelLIPHolder)))
+	if st != efiSuccess {
+		writeASCII(co, "    HandleProtocol(LoadedImage) failed: ")
+		writeHex64(co, st)
+		writeASCII(co, "\r\n")
+	} else {
+		lip := (*efiLoadedImageProtocol)(unsafe.Pointer(kernelLIPHolder))
+		// Count UTF-16 chars excl. NUL.
+		n := uint32(0)
+		for cmdlineUTF16[n] != 0 && int(n) < len(cmdlineUTF16) {
+			n++
+		}
+		lip.loadOptions = uintptr(unsafe.Pointer(&cmdlineUTF16[0]))
+		lip.loadOptionsSize = (n + 1) * 2
+		writeASCII(co, "    patched LoadOptions (")
+		writeDec(co, uint64(lip.loadOptionsSize))
+		writeASCII(co, " bytes)\r\n")
+	}
+
+	writeASCII(co, "    StartImage...\r\n")
+	st = efiCall3(bs.startImage, kernelImageHandle, 0, 0)
+	writeASCII(co, "    StartImage returned: ")
+	writeHex64(co, st)
+	writeASCII(co, "\r\n")
+}
+
 // readKernel resolves the kernel inode, AllocatePool's a buffer of
 // the right size from EfiLoaderData, reads every data block through
 // the extent walker, then sanity-checks the result by looking for
@@ -980,6 +1084,9 @@ func readKernel(co *efiSimpleTextOutput, bs *efiBootServices,
 	writeASCII(co, "    readFile OK, ")
 	writeDec(co, got)
 	writeASCII(co, " bytes\r\n")
+
+	// Remember the size for chainKernel.
+	loadedKernelSize = got
 
 	// PE/COFF sanity check: first two bytes must be "MZ"; the LE u32
 	// at offset 0x3C points at the "PE\0\0" signature.
@@ -1400,6 +1507,9 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 					writeDec(co, uint64(kFT))
 					writeASCII(co, ")\r\n")
 					readKernel(co, bs, lastBIO, lastMediaId, lastDevBlkSz, &lastSB, kIno)
+					if loadedKernelSize > 0 && kernelBufPtr != 0 {
+						chainKernel(co, bs, imageHandle, loadedKernelSize)
+					}
 				}
 			}
 		}
