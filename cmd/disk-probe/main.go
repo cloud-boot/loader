@@ -414,6 +414,203 @@ func printExt4SB(co *efiSimpleTextOutput, sb *ext4SB) {
 	writeASCII(co, ")\r\n")
 }
 
+// ----- ext4 inode + extent tree -----
+//
+// Modern ext4 (with EXT4_FEATURE_INCOMPAT_EXTENTS, which the Debian
+// cloud image uses) addresses data blocks through an in-inode extent
+// tree. The 60-byte i_block area at inode offset 0x28 holds:
+//
+//   ext4_extent_header { magic(2)=0xF30A, entries(2), max(2),
+//                        depth(2), generation(4) }       // 12 bytes
+//   followed by `entries` extent entries (12 B each):
+//     depth == 0 — leaf:
+//       ee_block(4)  first logical block in this extent
+//       ee_len(2)    block count (clamped to 32768 if "uninitialised")
+//       ee_start_hi(2) | ee_start_lo(4)  physical block
+//     depth >  0 — index node:
+//       ei_block(4)  first logical block covered by this child
+//       ei_leaf_lo(4) | ei_leaf_hi(2) | ei_unused(2)  child block ptr
+//
+// 60 / 12 = 5 → header + 4 inline extents per inode. Larger files
+// chain through index nodes living in separate blocks.
+
+const (
+	extentHeaderMagic uint16 = 0xF30A
+	inodeBlockOff     uint32 = 0x28 // start of i_block within an inode
+	inodeBlockSize    uint32 = 60   // size of i_block
+
+	// inode flag bits we care about.
+	inodeFlagExtents uint32 = 0x80000
+)
+
+type ext4Inode struct {
+	mode       uint16 // 0x00
+	sizeLo     uint32 // 0x04
+	flags      uint32 // 0x20
+	sizeHi     uint32 // 0x6C
+	// i_block (60 bytes) starts at offset 0x28 in the raw inode data.
+}
+
+// extentHeader is what sits at offset 0 of i_block (or at offset 0 of
+// any extent-index node's body).
+type extentHeader struct {
+	magic      uint16
+	entries    uint16
+	maxEntries uint16
+	depth      uint16
+	generation uint32
+}
+
+func parseInode(raw []byte, ino *ext4Inode) bool {
+	if len(raw) < 0x80 {
+		return false
+	}
+	ino.mode = le16(raw[0x00:])
+	ino.sizeLo = le32(raw[0x04:])
+	ino.flags = le32(raw[0x20:])
+	ino.sizeHi = le32(raw[0x6C:]) // i_size_high (for files; reserved on dirs)
+	return true
+}
+
+func parseExtentHeader(raw []byte, eh *extentHeader) bool {
+	if len(raw) < 12 {
+		return false
+	}
+	eh.magic = le16(raw[0:])
+	eh.entries = le16(raw[2:])
+	eh.maxEntries = le16(raw[4:])
+	eh.depth = le16(raw[6:])
+	eh.generation = le32(raw[8:])
+	return eh.magic == extentHeaderMagic
+}
+
+// readInode reads inode `inoNum` from the partition into rawInodeBuf
+// at offset (inodeSize bytes starting at index 0). Returns true on
+// success; the caller can then `parseInode(rawInodeBuf[:inodeSize])`
+// and pull the extent header out of rawInodeBuf[0x28:].
+func readInode(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32, sb *ext4SB, inoNum uint32) bool {
+	if inoNum == 0 || sb.inodesPerGroup == 0 || sb.blockSize == 0 {
+		return false
+	}
+	group := (inoNum - 1) / sb.inodesPerGroup
+	idxInGroup := (inoNum - 1) % sb.inodesPerGroup
+	if uint64(group) >= sb.totalGroups {
+		writeASCII(co, "    readInode: group out of range\r\n")
+		return false
+	}
+	// Find the inode table for this group via the GDT. GDT byte
+	// offset = blockSize (for blockSize > 1024). Entry `group` starts
+	// at gdtByte + group*descSize.
+	gdtByte := sb.blockSize
+	if sb.blockSize == 1024 {
+		gdtByte = 2 * 1024
+	}
+	entryByte := gdtByte + uint64(group)*uint64(sb.descSize)
+	// Read the block containing the GDT entry.
+	gdtBlkLBA := entryByte / uint64(devBlkSz)
+	gdtBlkOff := entryByte % uint64(devBlkSz)
+	// Need descSize bytes starting at gdtBlkOff. Read one device
+	// sector — descSize ≤ 64 ≤ 512 so it can't straddle.
+	for k := 0; k < len(probeBuf); k++ {
+		probeBuf[k] = 0
+	}
+	if rst := readBlocks(bio, mediaId, gdtBlkLBA, uintptr(devBlkSz),
+		uintptr(unsafe.Pointer(&probeBuf[0]))); rst != efiSuccess {
+		writeASCII(co, "    readInode GDT read failed: ")
+		writeHex64(co, rst)
+		writeASCII(co, "\r\n")
+		return false
+	}
+	itLo := le32(probeBuf[gdtBlkOff+0x08:])
+	var inodeTableBlk uint64
+	if sb.is64bit && sb.descSize >= 64 {
+		itHi := le32(probeBuf[gdtBlkOff+0x28:])
+		inodeTableBlk = (uint64(itHi) << 32) | uint64(itLo)
+	} else {
+		inodeTableBlk = uint64(itLo)
+	}
+	// Inode's byte offset in the partition.
+	inoByte := inodeTableBlk*sb.blockSize + uint64(idxInGroup)*uint64(sb.inodeSize)
+	inoLBA := inoByte / uint64(devBlkSz)
+	inoOff := inoByte % uint64(devBlkSz)
+	// Read one block (4 KiB) covering the inode. Inode size ≤ 256 so
+	// it fits even if inoOff is near the end of a 512-byte sector.
+	for k := 0; k < len(probeBuf); k++ {
+		probeBuf[k] = 0
+	}
+	if rst := readBlocks(bio, mediaId, inoLBA, uintptr(sb.blockSize),
+		uintptr(unsafe.Pointer(&probeBuf[0]))); rst != efiSuccess {
+		writeASCII(co, "    readInode inode read failed: ")
+		writeHex64(co, rst)
+		writeASCII(co, "\r\n")
+		return false
+	}
+	// Copy the inode bytes to the front of rawInodeBuf so the parsers
+	// don't have to know about the in-block offset.
+	for k := uint32(0); k < uint32(sb.inodeSize); k++ {
+		rawInodeBuf[k] = probeBuf[uint32(inoOff)+k]
+	}
+	return true
+}
+
+// rawInodeBuf is the working area for the most-recently-read inode.
+// Sized for 256 (= ext4 default); 128-byte ext2 inodes fit too.
+var rawInodeBuf [256]byte
+
+// dumpExtentTree prints the extent header + entries from a raw 60-byte
+// i_block area. Index nodes are reported but not followed (the
+// follow-the-pointer path comes in step 4 / 5 once we need it for
+// reading directory blocks).
+func dumpExtentTree(co *efiSimpleTextOutput, iblock []byte) {
+	var eh extentHeader
+	if !parseExtentHeader(iblock, &eh) {
+		writeASCII(co, "    extent header: bad magic ")
+		writeHex64(co, uint64(le16(iblock[0:])))
+		writeASCII(co, "\r\n")
+		return
+	}
+	writeASCII(co, "    extent header: entries=")
+	writeDec(co, uint64(eh.entries))
+	writeASCII(co, " max=")
+	writeDec(co, uint64(eh.maxEntries))
+	writeASCII(co, " depth=")
+	writeDec(co, uint64(eh.depth))
+	writeASCII(co, "\r\n")
+	for i := uint16(0); i < eh.entries && (12+int(i)*12+12) <= len(iblock); i++ {
+		off := 12 + int(i)*12
+		if eh.depth == 0 {
+			// Leaf — extent.
+			eeBlock := le32(iblock[off+0:])
+			eeLen := le16(iblock[off+4:])
+			eeStartHi := le16(iblock[off+6:])
+			eeStartLo := le32(iblock[off+8:])
+			eeStart := (uint64(eeStartHi) << 32) | uint64(eeStartLo)
+			writeASCII(co, "      ext[")
+			writeDec(co, uint64(i))
+			writeASCII(co, "]: logical=")
+			writeDec(co, uint64(eeBlock))
+			writeASCII(co, " len=")
+			writeDec(co, uint64(eeLen))
+			writeASCII(co, " physical=")
+			writeHex64(co, eeStart)
+			writeASCII(co, "\r\n")
+		} else {
+			// Index node.
+			eiBlock := le32(iblock[off+0:])
+			eiLeafLo := le32(iblock[off+4:])
+			eiLeafHi := le16(iblock[off+8:])
+			eiLeaf := (uint64(eiLeafHi) << 32) | uint64(eiLeafLo)
+			writeASCII(co, "      idx[")
+			writeDec(co, uint64(i))
+			writeASCII(co, "]: logical=")
+			writeDec(co, uint64(eiBlock))
+			writeASCII(co, " leaf=")
+			writeHex64(co, eiLeaf)
+			writeASCII(co, "\r\n")
+		}
+	}
+}
+
 // ext4InspectGroupDesc reads the group-descriptor at index 0 from the
 // GDT (always at byte offset blockSize, for blockSize >= 2048) and
 // prints the inode table block address for that group. This validates
@@ -649,6 +846,26 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 		detectFilesystem(co, probeBuf[:])
 		if lastSBValid {
 			ext4InspectGroupDesc(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB)
+			// Read root inode (always #2) and dump its extent tree.
+			// This validates inode locating + extent header parsing
+			// without yet following pointers to child nodes.
+			if readInode(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB, 2) {
+				var rootIno ext4Inode
+				if parseInode(rawInodeBuf[:], &rootIno) {
+					sz := (uint64(rootIno.sizeHi) << 32) | uint64(rootIno.sizeLo)
+					writeASCII(co, "    inode #2: mode=")
+					writeHex64(co, uint64(rootIno.mode))
+					writeASCII(co, " size=")
+					writeDec(co, sz)
+					writeASCII(co, " flags=")
+					writeHex64(co, uint64(rootIno.flags))
+					if rootIno.flags&inodeFlagExtents != 0 {
+						writeASCII(co, " (extents)")
+					}
+					writeASCII(co, "\r\n")
+					dumpExtentTree(co, rawInodeBuf[inodeBlockOff:inodeBlockOff+inodeBlockSize])
+				}
+			}
 		}
 	}
 
