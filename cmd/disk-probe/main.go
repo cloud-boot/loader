@@ -244,6 +244,19 @@ var (
 	// offset 1024; FAT BPB at 0; GPT header at LBA 1. All comfortably
 	// inside 4 KiB.
 	probeBuf [4096]byte
+
+	// Latest parsed ext4 superblock. Populated by parseExt4SB when
+	// detectFilesystem classifies a handle as ext4. Step 3+ will use
+	// it together with the BlockIO handle to read inode tables.
+	lastSB      ext4SB
+	lastSBValid bool
+
+	// Remember the BlockIO context that produced lastSB so the GDT
+	// follow-up read uses the right handle/media/blksize without
+	// passing parameters through detectFilesystem.
+	lastBIO       uintptr
+	lastMediaId   uint32
+	lastDevBlkSz  uint32
 )
 
 // readBlocks calls EFI_BLOCK_IO.ReadBlocks(this, MediaId, LBA, Size, Buffer).
@@ -255,6 +268,197 @@ func readBlocks(bio uintptr, mediaId uint32, lba uint64, size uintptr, buf uintp
 		uintptr(lba),
 		size,
 		buf)
+}
+
+// ----- ext4 superblock parsing -----
+//
+// The superblock starts at byte offset 1024 of the filesystem
+// (independently of the underlying block size). It's 1024 bytes long.
+// We only mirror the fields we need to walk inode tables; everything
+// else gets accessed by raw offset.
+
+type ext4SB struct {
+	inodesCount      uint32 // 0x00
+	blocksCountLo    uint32 // 0x04
+	rsvdBlocksLo     uint32 // 0x08
+	freeBlocksLo     uint32 // 0x0C
+	freeInodesCount  uint32 // 0x10
+	firstDataBlock   uint32 // 0x14
+	logBlockSize     uint32 // 0x18 — block size = 1 << (10 + this)
+	blocksPerGroup   uint32 // 0x20
+	inodesPerGroup   uint32 // 0x28
+	magic            uint16 // 0x38
+	revLevel         uint32 // 0x4C  (0 = ext2-classic; 1 = dynamic)
+	firstIno         uint32 // 0x54  (usually 11; root is ALWAYS inode 2)
+	inodeSize        uint16 // 0x58  (128 or 256)
+	featureCompat    uint32 // 0x5C
+	featureIncompat  uint32 // 0x60
+	featureROCompat  uint32 // 0x64
+	descSize         uint16 // 0xFE  (64 if 64bit feature, 32 otherwise)
+	blocksCountHi    uint32 // 0x150 (with 64bit feature)
+	logGroupsPerFlex uint8  // 0x174 (flex_bg)
+
+	// Derived.
+	blockSize  uint64
+	is64bit    bool
+	totalBlks  uint64
+	totalGroups uint64
+}
+
+const (
+	ext4FeatureIncompat64Bit  uint32 = 0x80
+	ext4FeatureIncompatExtent uint32 = 0x40
+	ext4FeatureCompatExtNames uint32 = 0x4 // dir_index
+)
+
+// parseExt4SB fills `sb` from `data` (must contain at least 2048
+// bytes — the partition's first 2 blocks of 1024). Returns true if
+// the magic checks out.
+func parseExt4SB(data []byte, sb *ext4SB) bool {
+	if len(data) < 0x500 {
+		return false
+	}
+	const o = 1024 // superblock offset
+	sb.inodesCount = le32(data[o+0x00:])
+	sb.blocksCountLo = le32(data[o+0x04:])
+	sb.rsvdBlocksLo = le32(data[o+0x08:])
+	sb.freeBlocksLo = le32(data[o+0x0C:])
+	sb.freeInodesCount = le32(data[o+0x10:])
+	sb.firstDataBlock = le32(data[o+0x14:])
+	sb.logBlockSize = le32(data[o+0x18:])
+	sb.blocksPerGroup = le32(data[o+0x20:])
+	sb.inodesPerGroup = le32(data[o+0x28:])
+	sb.magic = le16(data[o+0x38:])
+	if sb.magic != 0xEF53 {
+		return false
+	}
+	sb.revLevel = le32(data[o+0x4C:])
+	sb.firstIno = le32(data[o+0x54:])
+	sb.inodeSize = le16(data[o+0x58:])
+	sb.featureCompat = le32(data[o+0x5C:])
+	sb.featureIncompat = le32(data[o+0x60:])
+	sb.featureROCompat = le32(data[o+0x64:])
+	sb.descSize = le16(data[o+0xFE:])
+	sb.blocksCountHi = le32(data[o+0x150:])
+	sb.logGroupsPerFlex = data[o+0x174]
+
+	// Inode size defaults to 128 for ext2 (revLevel=0).
+	if sb.inodeSize == 0 {
+		sb.inodeSize = 128
+	}
+	// desc_size defaults to 32 unless the 64bit feature is on AND a
+	// non-zero value is recorded.
+	sb.is64bit = sb.featureIncompat&ext4FeatureIncompat64Bit != 0
+	if sb.descSize == 0 {
+		sb.descSize = 32
+	} else if !sb.is64bit && sb.descSize < 32 {
+		sb.descSize = 32
+	}
+
+	sb.blockSize = uint64(1) << (10 + sb.logBlockSize)
+	sb.totalBlks = uint64(sb.blocksCountLo)
+	if sb.is64bit {
+		sb.totalBlks |= uint64(sb.blocksCountHi) << 32
+	}
+	if sb.blocksPerGroup > 0 {
+		sb.totalGroups = (sb.totalBlks + uint64(sb.blocksPerGroup) - 1) /
+			uint64(sb.blocksPerGroup)
+	}
+	return true
+}
+
+func le16(b []byte) uint16 {
+	return uint16(b[0]) | uint16(b[1])<<8
+}
+func le32(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+
+// printExt4SB dumps the parsed fields for diagnostic.
+func printExt4SB(co *efiSimpleTextOutput, sb *ext4SB) {
+	writeASCII(co, "    ext4 SB: blockSize=")
+	writeDec(co, sb.blockSize)
+	writeASCII(co, " inodeSize=")
+	writeDec(co, uint64(sb.inodeSize))
+	writeASCII(co, " inodesPerGroup=")
+	writeDec(co, uint64(sb.inodesPerGroup))
+	writeASCII(co, " blocksPerGroup=")
+	writeDec(co, uint64(sb.blocksPerGroup))
+	writeASCII(co, "\r\n    rev=")
+	writeDec(co, uint64(sb.revLevel))
+	writeASCII(co, " firstIno=")
+	writeDec(co, uint64(sb.firstIno))
+	writeASCII(co, " totalBlocks=")
+	writeDec(co, sb.totalBlks)
+	writeASCII(co, " totalGroups=")
+	writeDec(co, sb.totalGroups)
+	writeASCII(co, " descSize=")
+	writeDec(co, uint64(sb.descSize))
+	writeASCII(co, "\r\n    feat: ")
+	if sb.is64bit {
+		writeASCII(co, "64bit ")
+	}
+	if sb.featureIncompat&ext4FeatureIncompatExtent != 0 {
+		writeASCII(co, "extents ")
+	}
+	if sb.featureIncompat&0x200 != 0 {
+		writeASCII(co, "flex_bg ")
+	}
+	if sb.featureCompat&ext4FeatureCompatExtNames != 0 {
+		writeASCII(co, "dir_index ")
+	}
+	writeASCII(co, "(incompat=")
+	writeHex64(co, uint64(sb.featureIncompat))
+	writeASCII(co, " compat=")
+	writeHex64(co, uint64(sb.featureCompat))
+	writeASCII(co, ")\r\n")
+}
+
+// ext4InspectGroupDesc reads the group-descriptor at index 0 from the
+// GDT (always at byte offset blockSize, for blockSize >= 2048) and
+// prints the inode table block address for that group. This validates
+// the descSize math + that BlockIO can read past the first 4 KiB.
+func ext4InspectGroupDesc(co *efiSimpleTextOutput, bio uintptr, mediaId, blkSize uint32, sb *ext4SB) {
+	// GDT lives at: byte offset = blockSize if blockSize > 1024,
+	//                 else byte offset = 2 * blockSize.
+	gdtByte := sb.blockSize
+	if sb.blockSize == 1024 {
+		gdtByte = 2 * 1024
+	}
+	// Read one block starting from gdtByte. The underlying device
+	// uses blkSize-byte sectors; convert byte offset to LBA.
+	lba := uint64(gdtByte) / uint64(blkSize)
+	// Need at least descSize bytes; pull a whole sector.
+	for k := 0; k < len(probeBuf); k++ {
+		probeBuf[k] = 0
+	}
+	if rst := readBlocks(bio, mediaId, lba, uintptr(blkSize),
+		uintptr(unsafe.Pointer(&probeBuf[0]))); rst != efiSuccess {
+		writeASCII(co, "    GDT read failed: ")
+		writeHex64(co, rst)
+		writeASCII(co, "\r\n")
+		return
+	}
+	// Group descriptor 0 layout (32B or 64B):
+	//   uint32 bg_block_bitmap_lo     // 0x00
+	//   uint32 bg_inode_bitmap_lo     // 0x04
+	//   uint32 bg_inode_table_lo      // 0x08
+	//   uint16 bg_free_blocks_count_lo
+	//   uint16 bg_free_inodes_count_lo
+	//   uint16 bg_used_dirs_count_lo
+	//   uint16 bg_flags
+	//   …
+	//   (descSize == 64): bg_block_bitmap_hi / bg_inode_bitmap_hi /
+	//   bg_inode_table_hi at offsets 0x20 / 0x24 / 0x28.
+	inodeTblLo := le32(probeBuf[0x08:])
+	writeASCII(co, "    GDT[0]: inodeTbl=")
+	if sb.is64bit && sb.descSize >= 64 {
+		inodeTblHi := le32(probeBuf[0x28:])
+		writeHex64(co, (uint64(inodeTblHi)<<32)|uint64(inodeTblLo))
+	} else {
+		writeHex64(co, uint64(inodeTblLo))
+	}
+	writeASCII(co, "\r\n")
 }
 
 // detectFilesystem reads the first 4 KiB of a partition and reports
@@ -291,44 +495,26 @@ func detectFilesystem(co *efiSimpleTextOutput, data []byte) {
 	}
 
 	// ext4 magic at offset 0x438.
-	if len(data) >= 0x43A {
-		magic := uint16(data[0x438]) | uint16(data[0x439])<<8
-		if magic == 0xEF53 {
-			writeASCII(co, "    fs: ext2/3/4")
-			// s_rev_level at 0x44C (bytes 0x44C-0x44F). v0 = ext2-ish,
-			// v1 = ext3/4 with dynamic-size features.
-			if len(data) >= 0x450 {
-				rev := uint32(data[0x44C]) |
-					uint32(data[0x44D])<<8 |
-					uint32(data[0x44E])<<16 |
-					uint32(data[0x44F])<<24
-				writeASCII(co, " rev=")
-				writeDec(co, uint64(rev))
+	if len(data) >= 0x500 && le16(data[0x438:]) == 0xEF53 {
+		writeASCII(co, "    fs: ext4")
+		// s_volume_name at offset 0x478 (16 ASCII bytes).
+		writeASCII(co, " label=\"")
+		for i := 0x478; i < 0x488; i++ {
+			if data[i] == 0 {
+				break
 			}
-			// s_log_block_size at offset 0x418 — log2(blockSize) - 10.
-			if len(data) >= 0x41C {
-				logBs := uint32(data[0x418]) |
-					uint32(data[0x419])<<8 |
-					uint32(data[0x41A])<<16 |
-					uint32(data[0x41B])<<24
-				bs := uint64(1) << (10 + logBs)
-				writeASCII(co, " blkSize=")
-				writeDec(co, bs)
-			}
-			// s_volume_name at offset 0x478 (16 ASCII bytes).
-			writeASCII(co, " label=\"")
-			if len(data) >= 0x488 {
-				for i := 0x478; i < 0x488; i++ {
-					if data[i] == 0 {
-						break
-					}
-					oneCharBuf[0] = data[i]
-					writeASCII(co, oneCharStr)
-				}
-			}
-			writeASCII(co, "\"\r\n")
-			return
+			oneCharBuf[0] = data[i]
+			writeASCII(co, oneCharStr)
 		}
+		writeASCII(co, "\"\r\n")
+		// Full superblock dump — populates sb for downstream use.
+		if parseExt4SB(data, &lastSB) {
+			lastSBValid = true
+			printExt4SB(co, &lastSB)
+		} else {
+			writeASCII(co, "    (superblock parse failed)\r\n")
+		}
+		return
 	}
 
 	// FAT detection — VBR signature 0xAA55 at offset 0x1FE, then look
@@ -454,7 +640,16 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 			writeASCII(co, "\r\n")
 			continue
 		}
+		// Stash context so detectFilesystem's ext4 branch can issue
+		// a follow-up GDT read without plumbing the args through.
+		lastSBValid = false
+		lastBIO = bioHolder
+		lastMediaId = media.mediaId
+		lastDevBlkSz = media.blockSize
 		detectFilesystem(co, probeBuf[:])
+		if lastSBValid {
+			ext4InspectGroupDesc(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB)
+		}
 	}
 
 	writeASCII(co, "DISK-PROBE-DONE\r\n")
