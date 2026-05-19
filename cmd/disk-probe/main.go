@@ -2000,7 +2000,11 @@ func findInBtrfsDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkS
 		if it.objectid != parentDirInode {
 			continue
 		}
-		if it.keyType != btrfsDirIndexKey {
+		// Accept both DIR_INDEX_KEY (0x61, sequential-index) and
+		// DIR_ITEM_KEY (0x60, name-hash-keyed) — both carry a
+		// btrfs_dir_item record. Some distros (openSUSE MicroOS)
+		// store FS_TREE dir entries only as DIR_ITEM_KEY.
+		if it.keyType != btrfsDirIndexKey && it.keyType != btrfsDirItemKey {
 			continue
 		}
 		dataPos := uint32(btrfsHeaderSize) + it.dataOff
@@ -2037,6 +2041,52 @@ func findInBtrfsDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkS
 	}
 	_ = co
 	return 0, false
+}
+
+// dumpBtrfsLeafAll prints every (objectid, type, offset) tuple in the
+// given tree-leaf block. Diagnostic for cases where the structure
+// doesn't match expectations (snapshot subvols, mostly).
+func dumpBtrfsLeafAll(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	logical uint64, nodesize uint32, label string,
+) {
+	phys, ok := btrfsLogicalToPhys(logical)
+	if !ok {
+		return
+	}
+	if !readBtrfsBlock(bio, mediaId, devBlkSz, phys, nodesize,
+		unsafe.Pointer(&btrfsTreeBuf[0])) {
+		return
+	}
+	if btrfsTreeBuf[100] != 0 {
+		return
+	}
+	nritems := le32(btrfsTreeBuf[96:])
+	writeASCII(co, "    ")
+	writeASCII(co, label)
+	writeASCII(co, " (")
+	writeDec(co, uint64(nritems))
+	writeASCII(co, " items):\r\n")
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
+		if off+btrfsItemSize > nodesize {
+			break
+		}
+		var it btrfsItem
+		if !parseBtrfsItem(btrfsTreeBuf[off:off+btrfsItemSize], &it) {
+			break
+		}
+		writeASCII(co, "      obj=")
+		writeDec(co, it.objectid)
+		writeASCII(co, " type=0x")
+		writeHex64(co, uint64(it.keyType))
+		writeASCII(co, " keyOff=")
+		writeHex64(co, it.keyOff)
+		writeASCII(co, " dataOff=")
+		writeDec(co, uint64(it.dataOff))
+		writeASCII(co, " size=")
+		writeDec(co, uint64(it.dataSize))
+		writeASCII(co, "\r\n")
+	}
 }
 
 // listBtrfsDir dumps every DIR_INDEX_KEY entry under `parentDirInode`
@@ -2124,11 +2174,128 @@ func listBtrfsDir(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32
 //   238        level           ← level of subvol tree root
 
 const (
-	btrfsRootItemKey       = 0x84 // BTRFS_ROOT_ITEM_KEY (132)
-	btrfsFsTreeObjectID    = 5    // BTRFS_FS_TREE_OBJECTID
-	btrfsRootItemBytenrOff = 176
-	btrfsRootItemLevelOff  = 238
+	btrfsRootItemKey         = 0x84 // BTRFS_ROOT_ITEM_KEY (132)
+	btrfsFsTreeObjectID      = 5    // BTRFS_FS_TREE_OBJECTID
+	btrfsRootTreeDirObjectID = 6    // BTRFS_ROOT_TREE_DIR_OBJECTID
+	btrfsRootItemBytenrOff   = 176
+	btrfsRootItemLevelOff    = 238
 )
+
+// btrfsActiveSubvolRootID holds the root_id of the default subvolume
+// (resolved via DIR_ITEM "default" under ROOT_TREE_DIR_OBJECTID=6).
+// Zero means "no override, use FS_TREE objectid=5".
+var btrfsActiveSubvolRootID uint64
+
+// walkRootTreeForDefaultSubvol scans the root-tree leaf for a
+// DIR_ITEM_KEY entry under ROOT_TREE_DIR_OBJECTID (6) whose name is
+// "default" and pulls out the subvolume's root_id from the
+// embedded btrfs_dir_item's location key. That's the
+// snapshot-subvolume indirection that distributions like openSUSE
+// MicroOS use to point at the active snapshot.
+//
+// Returns true if a default was found; sets
+// btrfsActiveSubvolRootID. Returns false on a "vanilla" btrfs
+// where the default IS FS_TREE — the caller should fall back to
+// FS_TREE objectid=5.
+func walkRootTreeForDefaultSubvol(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	rootLogical uint64, nodesize uint32,
+) bool {
+	rootPhys, ok := btrfsLogicalToPhys(rootLogical)
+	if !ok {
+		return false
+	}
+	if !readBtrfsBlock(bio, mediaId, devBlkSz, rootPhys, nodesize,
+		unsafe.Pointer(&btrfsTreeBuf[0])) {
+		return false
+	}
+	if btrfsTreeBuf[100] != 0 {
+		// Internal node — multi-level walk not implemented.
+		return false
+	}
+	nritems := le32(btrfsTreeBuf[96:])
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
+		if off+btrfsItemSize > nodesize {
+			break
+		}
+		var it btrfsItem
+		if !parseBtrfsItem(btrfsTreeBuf[off:off+btrfsItemSize], &it) {
+			break
+		}
+		if it.objectid != btrfsRootTreeDirObjectID || it.keyType != btrfsDirItemKey {
+			continue
+		}
+		dataPos := uint32(btrfsHeaderSize) + it.dataOff
+		if dataPos+30 > nodesize {
+			break
+		}
+		locObjID := le64(btrfsTreeBuf[dataPos:])
+		nameLen := le16(btrfsTreeBuf[dataPos+27:])
+		if nameLen == 7 && dataPos+30+7 <= nodesize {
+			n := btrfsTreeBuf[dataPos+30 : dataPos+37]
+			if n[0] == 'd' && n[1] == 'e' && n[2] == 'f' && n[3] == 'a' &&
+				n[4] == 'u' && n[5] == 'l' && n[6] == 't' {
+				btrfsActiveSubvolRootID = locObjID
+				writeASCII(co, "    btrfs default subvol root_id=")
+				writeDec(co, locObjID)
+				writeASCII(co, "\r\n")
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// walkRootTreeForSubvolRoot looks up the ROOT_ITEM_KEY whose
+// objectid matches `rootID`, and extracts the subvolume tree's
+// root-node bytenr + level. Same leaf, just a different filter from
+// walkRootTreeForFSTree.
+func walkRootTreeForSubvolRoot(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	rootLogical uint64, nodesize uint32, rootID uint64,
+	outBytenr *uint64, outLevel *uint8,
+) bool {
+	rootPhys, ok := btrfsLogicalToPhys(rootLogical)
+	if !ok {
+		return false
+	}
+	if !readBtrfsBlock(bio, mediaId, devBlkSz, rootPhys, nodesize,
+		unsafe.Pointer(&btrfsTreeBuf[0])) {
+		return false
+	}
+	if btrfsTreeBuf[100] != 0 {
+		return false
+	}
+	nritems := le32(btrfsTreeBuf[96:])
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
+		if off+btrfsItemSize > nodesize {
+			break
+		}
+		var it btrfsItem
+		if !parseBtrfsItem(btrfsTreeBuf[off:off+btrfsItemSize], &it) {
+			break
+		}
+		if it.objectid != rootID || it.keyType != btrfsRootItemKey {
+			continue
+		}
+		dataPos := uint32(btrfsHeaderSize) + it.dataOff
+		if dataPos+239 > nodesize {
+			break
+		}
+		*outBytenr = le64(btrfsTreeBuf[dataPos+btrfsRootItemBytenrOff:])
+		*outLevel = btrfsTreeBuf[dataPos+btrfsRootItemLevelOff]
+		writeASCII(co, "    subvol root_id=")
+		writeDec(co, rootID)
+		writeASCII(co, " bytenr=")
+		writeHex64(co, *outBytenr)
+		writeASCII(co, " level=")
+		writeDec(co, uint64(*outLevel))
+		writeASCII(co, "\r\n")
+		_ = co
+		return true
+	}
+	return false
+}
 
 // btrfsFsTreeRootLogical is the resolved logical address of the
 // FS_TREE root node, found by walkRootTreeForFSTree. btrfsFsTreeLevel
@@ -2331,10 +2498,34 @@ func probeBtrfsPartition(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz
 		writeASCII(co, "\r\n")
 	}
 
-	// Walk root tree → find FS_TREE.
-	if !walkRootTreeForFSTree(co, lastBIO, lastMediaId, lastDevBlkSz,
+	// First try the default-subvolume indirection: look up
+	// (objectid=6, type=DIR_ITEM_KEY, name="default") in the root
+	// tree → its location key gives the active subvol's root_id →
+	// look up that root_id's ROOT_ITEM_KEY → use its bytenr/level
+	// as the tree root we walk for /boot. Distros like openSUSE
+	// MicroOS use this snapshot indirection.
+	btrfsActiveSubvolRootID = 0
+	if walkRootTreeForDefaultSubvol(co, lastBIO, lastMediaId, lastDevBlkSz,
 		lastBtrfsSB.rootLogical, lastBtrfsSB.nodesize) {
-		return
+		var bytenr uint64
+		var level uint8
+		if walkRootTreeForSubvolRoot(co, lastBIO, lastMediaId, lastDevBlkSz,
+			lastBtrfsSB.rootLogical, lastBtrfsSB.nodesize,
+			btrfsActiveSubvolRootID, &bytenr, &level) {
+			btrfsFsTreeRootLogical = bytenr
+			btrfsFsTreeLevel = level
+		} else {
+			writeASCII(co, "    subvol root_item lookup failed; falling back to FS_TREE\r\n")
+			btrfsActiveSubvolRootID = 0
+		}
+	}
+	// Fall back to FS_TREE objectid=5 if default-subvol absent /
+	// unresolved.
+	if btrfsActiveSubvolRootID == 0 {
+		if !walkRootTreeForFSTree(co, lastBIO, lastMediaId, lastDevBlkSz,
+			lastBtrfsSB.rootLogical, lastBtrfsSB.nodesize) {
+			return
+		}
 	}
 	// Dump what's under FS_TREE root (inode 256) for diagnostic —
 	// MicroOS uses snapshot subvolumes so "/" isn't where we
@@ -2342,6 +2533,16 @@ func probeBtrfsPartition(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz
 	listBtrfsDir(co, lastBIO, lastMediaId, lastDevBlkSz,
 		btrfsFsTreeRootLogical, btrfsFsTreeLevel, lastBtrfsSB.nodesize,
 		btrfsFirstFreeObjectID)
+	// Also dump every item in the FS_TREE leaf to see what kind of
+	// keys are present (in case inode 256 isn't where the user-
+	// visible root directory lives).
+	dumpBtrfsLeafAll(co, lastBIO, lastMediaId, lastDevBlkSz,
+		btrfsFsTreeRootLogical, lastBtrfsSB.nodesize, "FS_TREE leaf items")
+	// And dump every item in the ROOT tree so we can see all
+	// available subvolumes (their objectids match
+	// ROOT_ITEM_KEYs).
+	dumpBtrfsLeafAll(co, lastBIO, lastMediaId, lastDevBlkSz,
+		lastBtrfsSB.rootLogical, lastBtrfsSB.nodesize, "root tree items")
 
 	// FS_TREE → find /boot under root inode 256.
 	bootInode, ok2 := findInBtrfsDirPrefix(co, lastBIO, lastMediaId, lastDevBlkSz,
