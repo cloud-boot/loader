@@ -958,6 +958,58 @@ var loadedImageGUID = efiGUID{
 	0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B,
 }
 
+// EFI_DEVICE_PATH_PROTOCOL_GUID — 09576e91-6d3f-11d2-8e39-00a0c969723b
+var devicePathGUID = efiGUID{
+	0x91, 0x6E, 0x57, 0x09,
+	0x3F, 0x6D,
+	0xD2, 0x11,
+	0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B,
+}
+
+// EFI_LOAD_FILE2_PROTOCOL_GUID — 4006c0c1-fcb3-403e-996d-4a6c8724e06d
+var loadFile2GUID = efiGUID{
+	0xC1, 0xC0, 0x06, 0x40,
+	0xB3, 0xFC,
+	0x3E, 0x40,
+	0x99, 0x6D, 0x4A, 0x6C, 0x87, 0x24, 0xE0, 0x6D,
+}
+
+// LINUX_EFI_INITRD_MEDIA_GUID — 5568e427-68fc-4f3d-ac74-ca555231cc68
+//
+// This is the vendor GUID Linux's EFI stub looks for: it scans every
+// handle in the system for one whose device path is a MEDIA_VENDOR
+// node carrying this GUID, then calls LoadFile2 on it to fetch the
+// initrd. See efi/libstub/efi-stub-helper.c and
+// efi/libstub/file.c in the kernel tree.
+var linuxInitrdGUID = efiGUID{
+	0x27, 0xE4, 0x68, 0x55,
+	0xFC, 0x68,
+	0x3D, 0x4F,
+	0xAC, 0x74, 0xCA, 0x55, 0x52, 0x31, 0xCC, 0x68,
+}
+
+// EFI_LOAD_FILE2_PROTOCOL is a single-method protocol whose
+// instance pointer the firmware (well, the Linux EFI stub here)
+// dereferences to find the LoadFile callback. The callback runs
+// in AAPCS64 — same convention every other firmware call uses on
+// arm64 — so we install a raw asm trampoline (loadFile2 in
+// thunk-arm64.S) that tail-calls our Go implementation
+// goLoadFile2.
+type efiLoadFile2Protocol struct {
+	loadFile uintptr
+}
+
+// loadFile2Ptr is defined in thunk-arm64.S — returns the runtime
+// address of the asm `loadFile2` entry symbol.
+//go:linkname loadFile2Ptr loadFile2Ptr
+func loadFile2Ptr() uintptr
+
+// EFI status codes the LoadFile2 callback needs.
+const (
+	efiInvalidParameter efiStatus = 0x8000000000000002
+	efiBufferTooSmall   efiStatus = 0x8000000000000005
+)
+
 // Hard-coded bring-up cmdline: serial console + label-based root.
 // Once the loader proper inherits this code path, the cmdline comes
 // from the CloudBootCmdline UEFI variable (Phase 5b).
@@ -979,7 +1031,179 @@ var (
 	// caller (here: _start) can pass the exact byte count to LoadImage
 	// without re-parsing the inode.
 	loadedKernelSize uint64
+
+	// Initrd state. initrdDataPtr+initrdSize describe the in-memory
+	// initrd buffer; the goLoadFile2 callback uses them to answer the
+	// kernel's LoadFile2 request.
+	initrdHandle   uintptr
+	initrdDataPtr  uintptr
+	initrdSize     uint64
+	initrdName     [255]byte
+	initrdNameLen  int
+	initrdProtocol efiLoadFile2Protocol
+
+	// Device path published on initrdHandle: MEDIA_VENDOR node with
+	// LINUX_EFI_INITRD_MEDIA_GUID + end-of-path terminator.
+	vendorMediaInitrdPath [24]byte
 )
+
+// "initrd.img-" — Debian / Ubuntu / Alpine all use this prefix.
+// RHEL/Fedora use "initramfs-" instead; the loader can scan for both
+// once we generalise. For Phase-5d bring-up against the Debian image
+// the single prefix is enough.
+var initrdPrefix = [...]byte{'i', 'n', 'i', 't', 'r', 'd', '.', 'i', 'm', 'g', '-'}
+
+// goLoadFile2 — the EFI_LOAD_FILE2_PROTOCOL.LoadFile callback the
+// Linux EFI stub invokes when it walks the system for an initrd
+// provider. Signature (UEFI 2.10 §13.4):
+//
+//	EFI_STATUS LoadFile(
+//	  EFI_LOAD_FILE2_PROTOCOL *This,
+//	  EFI_DEVICE_PATH_PROTOCOL *FilePath,
+//	  BOOLEAN BootPolicy,
+//	  UINTN *BufferSize,
+//	  VOID *Buffer);
+//
+// Two-pass protocol: kernel calls with Buffer=NULL to learn the
+// size (we return EFI_BUFFER_TOO_SMALL and write our size to
+// *BufferSize), then again with a buffer of that size.
+//
+//go:export goLoadFile2
+func goLoadFile2(self, devPath, bootPolicy uintptr, bufSizePtr *uint64, buf uintptr) uint64 {
+	if bufSizePtr == nil {
+		return uint64(efiInvalidParameter)
+	}
+	if buf == 0 || *bufSizePtr < initrdSize {
+		*bufSizePtr = initrdSize
+		return uint64(efiBufferTooSmall)
+	}
+	*bufSizePtr = initrdSize
+	// Byte-by-byte copy. With initrdSize ~30 MiB this takes ~tens of
+	// milliseconds on real hardware; acceptable for a one-shot.
+	for i := uint64(0); i < initrdSize; i++ {
+		*(*byte)(unsafe.Pointer(buf + uintptr(i))) =
+			*(*byte)(unsafe.Pointer(initrdDataPtr + uintptr(i)))
+	}
+	return uint64(efiSuccess)
+}
+
+// readInitrd locates /boot/initrd.img-* via prefix match, reads the
+// whole file into a fresh AllocatePool buffer, and stores it in
+// initrdDataPtr / initrdSize for the LoadFile2 callback.
+func readInitrd(co *efiSimpleTextOutput, bs *efiBootServices,
+	bio uintptr, mediaId, devBlkSz uint32, sb *ext4SB, bootIno uint32,
+) bool {
+	iIno, _, ok := findInDirPrefix(co, bio, mediaId, devBlkSz, sb, bootIno,
+		initrdPrefix[:], &initrdName, &initrdNameLen)
+	if !ok {
+		writeASCII(co, "    no initrd.img-* in /boot\r\n")
+		return false
+	}
+	writeASCII(co, "    initrd: ")
+	for i := 0; i < initrdNameLen; i++ {
+		oneCharBuf[0] = initrdName[i]
+		writeASCII(co, oneCharStr)
+	}
+	writeASCII(co, " (inode=")
+	writeDec(co, uint64(iIno))
+	writeASCII(co, ")\r\n")
+
+	if !readInode(co, bio, mediaId, devBlkSz, sb, iIno) {
+		return false
+	}
+	var ino ext4Inode
+	if !parseInode(rawInodeBuf[:], &ino) {
+		return false
+	}
+	fileSize := (uint64(ino.sizeHi) << 32) | uint64(ino.sizeLo)
+	writeASCII(co, "    initrd size = ")
+	writeDec(co, fileSize)
+	writeASCII(co, " bytes\r\n")
+
+	initrdDataPtr = 0
+	st := efiCall3(bs.allocatePool,
+		efiLoaderData,
+		uintptr(fileSize),
+		uintptr(unsafe.Pointer(&initrdDataPtr)))
+	if st != efiSuccess || initrdDataPtr == 0 {
+		writeASCII(co, "    AllocatePool(initrd) failed: ")
+		writeHex64(co, st)
+		writeASCII(co, "\r\n")
+		return false
+	}
+	got := readFile(co, bio, mediaId, devBlkSz, sb, iIno, initrdDataPtr, fileSize)
+	if got == 0 {
+		return false
+	}
+	initrdSize = got
+	writeASCII(co, "    readFile(initrd) OK, ")
+	writeDec(co, got)
+	writeASCII(co, " bytes\r\n")
+	return true
+}
+
+// installInitrdProtocol builds the MEDIA_VENDOR device-path node
+// (LINUX_EFI_INITRD_MEDIA_GUID) + end terminator, then publishes
+// DevicePath + LoadFile2 on a fresh handle. The two
+// InstallProtocolInterface calls follow go-coff/stub's Phase-3b
+// pattern exactly:
+//
+//   - First call's *initrdHandle == 0 → firmware creates a new
+//     handle and writes it back. DevicePath gets attached.
+//   - Second call uses the same handle to add LoadFile2 on top.
+//
+// After this returns, the Linux EFI stub will find our protocol
+// when it walks for the LINUX_EFI_INITRD_MEDIA_GUID device path.
+func installInitrdProtocol(co *efiSimpleTextOutput, bs *efiBootServices) bool {
+	// MEDIA_DEVICE_PATH (Type=0x04) / MEDIA_VENDOR (SubType=0x03),
+	// length 20 (4-byte header + 16-byte GUID).
+	vendorMediaInitrdPath[0] = 0x04
+	vendorMediaInitrdPath[1] = 0x03
+	vendorMediaInitrdPath[2] = 20
+	vendorMediaInitrdPath[3] = 0
+	for i := 0; i < 16; i++ {
+		vendorMediaInitrdPath[4+i] = linuxInitrdGUID[i]
+	}
+	// End-of-hardware-device-path: Type=0x7F, SubType=0xFF, Length=4.
+	vendorMediaInitrdPath[20] = 0x7F
+	vendorMediaInitrdPath[21] = 0xFF
+	vendorMediaInitrdPath[22] = 4
+	vendorMediaInitrdPath[23] = 0
+
+	initrdProtocol.loadFile = loadFile2Ptr()
+	writeASCII(co, "    LoadFile2 callback addr = ")
+	writeHex64(co, uint64(initrdProtocol.loadFile))
+	writeASCII(co, "\r\n")
+
+	const efiNativeInterface = 0
+	initrdHandle = 0
+	st := efiCall4(bs.installProtocolInterface,
+		uintptr(unsafe.Pointer(&initrdHandle)),
+		uintptr(unsafe.Pointer(&devicePathGUID)),
+		efiNativeInterface,
+		uintptr(unsafe.Pointer(&vendorMediaInitrdPath[0])))
+	if st != efiSuccess {
+		writeASCII(co, "    InstallProtocol(DevicePath) failed: ")
+		writeHex64(co, st)
+		writeASCII(co, "\r\n")
+		return false
+	}
+	st = efiCall4(bs.installProtocolInterface,
+		uintptr(unsafe.Pointer(&initrdHandle)),
+		uintptr(unsafe.Pointer(&loadFile2GUID)),
+		efiNativeInterface,
+		uintptr(unsafe.Pointer(&initrdProtocol)))
+	if st != efiSuccess {
+		writeASCII(co, "    InstallProtocol(LoadFile2) failed: ")
+		writeHex64(co, st)
+		writeASCII(co, "\r\n")
+		return false
+	}
+	writeASCII(co, "    initrd protocols installed on handle ")
+	writeHex64(co, uint64(initrdHandle))
+	writeASCII(co, "\r\n")
+	return true
+}
 
 // chainKernel LoadImages the kernel buffer, patches LoadOptions,
 // then StartImages it. On the happy path control never returns; on
@@ -1508,6 +1732,12 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 					writeASCII(co, ")\r\n")
 					readKernel(co, bs, lastBIO, lastMediaId, lastDevBlkSz, &lastSB, kIno)
 					if loadedKernelSize > 0 && kernelBufPtr != 0 {
+						// Load + register the initrd before StartImage
+						// so the Linux EFI stub's LoadFile2 walk
+						// finds our protocol.
+						if readInitrd(co, bs, lastBIO, lastMediaId, lastDevBlkSz, &lastSB, bootIno) {
+							installInitrdProtocol(co, bs)
+						}
 						chainKernel(co, bs, imageHandle, loadedKernelSize)
 					}
 				}

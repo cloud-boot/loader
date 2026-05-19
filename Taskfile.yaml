@@ -315,19 +315,25 @@ tasks:
       - "mformat -i esp.img -F ::"
       - "mmd -i esp.img ::EFI ::EFI/BOOT"
       - "mcopy -i esp.img {{.DISK_PROBE_ARM64_OUT}} ::EFI/BOOT/BOOTAA64.EFI"
+      # Use a qcow2 overlay on top of the raw image so the cloud
+      # image stays read-only on disk while Linux gets a writable
+      # virtio drive (ext4 journal replay needs that). The overlay
+      # is recreated on every run.
+      - rm -f cloud-overlay.qcow2
+      - qemu-img create -f qcow2 -F raw -b {{.DEBIAN_RAW}} cloud-overlay.qcow2 > /dev/null
       - >-
         qemu-system-aarch64
         -machine virt,gic-version=max,accel=hvf:tcg -cpu max -m 1024 -smp 2
         -drive if=pflash,format=raw,readonly=on,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd
         -drive if=pflash,format=raw,file=ovmf_vars_arm64.fd
         -drive if=virtio,format=raw,file=esp.img,id=esp
-        -drive if=virtio,format=raw,file={{.DEBIAN_RAW}},id=cloud,readonly=on
+        -drive if=virtio,format=qcow2,file=cloud-overlay.qcow2,id=cloud
         -nographic -serial mon:stdio
 
   clean:
     cmds:
       - rm -f cmd/efi-probe/*.o cmd/efi-probe/*.EFI cmd/efi-probe/esp.img cmd/efi-probe/ovmf_vars_arm64.fd
-      - rm -f cmd/disk-probe/*.o cmd/disk-probe/*.EFI cmd/disk-probe/esp.img cmd/disk-probe/ovmf_vars_arm64.fd
+      - rm -f cmd/disk-probe/*.o cmd/disk-probe/*.EFI cmd/disk-probe/esp.img cmd/disk-probe/ovmf_vars_arm64.fd cmd/disk-probe/cloud-overlay.qcow2
       - rm -f cmd/efi-loader/*.o cmd/efi-loader/*.EFI cmd/efi-loader/esp.img cmd/efi-loader/ovmf_vars_arm64.fd
       - rm -rf cmd/efi-loader/esp-stage cmd/efi-loader/esp-loader.iso
       - rm -f cmd/efivar-stage/efivar-stage
