@@ -1620,7 +1620,145 @@ func printXfsSB(co *efiSimpleTextOutput, sb *xfsSB) {
 var (
 	lastXfsSB      xfsSB
 	lastXfsSBValid bool
+
+	// Working area for the most-recently-read xfs inode. xfs inode
+	// size is 256 (legacy) or 512 (v5 default); 512 covers both.
+	xfsInodeBuf [512]byte
 )
+
+// ----- xfs inode -----
+//
+// xfs_dinode core is 96 bytes (v4) or 176 bytes (v5, with CRC +
+// changecount + lsn + flags2 + crtime + ino + uuid).
+//
+// Layout (BE on disk):
+//   0   di_magic (u16)   "IN" = 0x494E
+//   2   di_mode  (u16)
+//   4   di_version (u8)  1|2|3   (3 = v5 inode with CRC)
+//   5   di_format  (u8)  1=local, 2=extents, 3=btree
+//  …
+//  56   di_size (u64)
+//  76   di_nextents (u32) — count of records in the data extent list
+//
+// Data fork starts at:
+//   v4 (di_version <= 2): offset 96
+//   v5 (di_version == 3): offset 176
+//
+// For our cloud-boot use we only need format=2 (extents) on files
+// and format=1 (local) or 2 (extents) on directories.
+
+const (
+	xfsDinodeMagic uint16 = 0x494E // "IN"
+	xfsCoreV4             = 96
+	xfsCoreV5             = 176
+
+	xfsFormatLocal   uint8 = 1
+	xfsFormatExtents uint8 = 2
+	xfsFormatBtree   uint8 = 3
+)
+
+type xfsInode struct {
+	magic    uint16
+	mode     uint16
+	version  uint8
+	format   uint8
+	size     uint64
+	nextents uint32
+}
+
+func parseXfsInode(raw []byte, ino *xfsInode) bool {
+	if len(raw) < 80 {
+		return false
+	}
+	ino.magic = be16(raw[0:])
+	if ino.magic != xfsDinodeMagic {
+		return false
+	}
+	ino.mode = be16(raw[2:])
+	ino.version = raw[4]
+	ino.format = raw[5]
+	ino.size = be64(raw[56:])
+	ino.nextents = be32(raw[76:])
+	return true
+}
+
+// xfsDataForkOffset returns the byte offset of the data fork within
+// the raw inode bytes.
+func xfsDataForkOffset(version uint8) uint32 {
+	if version >= 3 {
+		return xfsCoreV5
+	}
+	return xfsCoreV4
+}
+
+// readXfsInode reads inode `inoNum` from the partition into
+// xfsInodeBuf. Returns true on success.
+//
+// XFS inode numbers encode (agno, agbno, offset) bit-shifted:
+//   inopblog       = log2(inopblock)
+//   agblklog       = log2(agblocks rounded up)
+//   agino_log      = inopblog + agblklog
+//   agno           = ino >> agino_log
+//   agino          = ino & ((1<<agino_log) - 1)
+//   agbno          = agino >> inopblog
+//   offsetInBlock  = agino & ((1<<inopblog) - 1)
+//
+// Physical position = agno*agblocks*blockSize + agbno*blockSize +
+//                     offsetInBlock*inodeSize.
+func readXfsInode(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32, sb *xfsSB, inoNum uint64) bool {
+	if sb.inopblock == 0 || sb.blockSize == 0 {
+		return false
+	}
+	aginoLog := uint64(sb.inopblog) + uint64(sb.agblklog)
+	agno := inoNum >> aginoLog
+	agino := inoNum & ((1 << aginoLog) - 1)
+	agbno := agino >> uint64(sb.inopblog)
+	off := agino & ((1 << uint64(sb.inopblog)) - 1)
+	if uint64(agno) >= uint64(sb.agcount) {
+		writeASCII(co, "    readXfsInode: agno out of range\r\n")
+		return false
+	}
+	byteOff := agno*uint64(sb.agblocks)*uint64(sb.blockSize) +
+		agbno*uint64(sb.blockSize) +
+		off*uint64(sb.inodesize)
+	// Underlying device sectors are devBlkSz bytes; align down to a
+	// sector and pull one fs-block (4 KiB) to comfortably cover the
+	// inode regardless of in-block offset.
+	lba := byteOff / uint64(devBlkSz)
+	inSec := byteOff % uint64(devBlkSz)
+	if inSec+uint64(sb.inodesize) > uint64(sb.blockSize) {
+		writeASCII(co, "    readXfsInode: inode straddles fs-block — unexpected\r\n")
+		return false
+	}
+	for k := 0; k < len(probeBuf); k++ {
+		probeBuf[k] = 0
+	}
+	if readBlocks(bio, mediaId, lba, uintptr(sb.blockSize),
+		uintptr(unsafe.Pointer(&probeBuf[0]))) != efiSuccess {
+		return false
+	}
+	// Copy inodeSize bytes starting at inSec into xfsInodeBuf.
+	for k := uint32(0); k < uint32(sb.inodesize); k++ {
+		xfsInodeBuf[k] = probeBuf[uint32(inSec)+k]
+	}
+	return true
+}
+
+func printXfsInode(co *efiSimpleTextOutput, ino *xfsInode) {
+	writeASCII(co, "    xfs inode: magic=")
+	writeHex64(co, uint64(ino.magic))
+	writeASCII(co, " mode=")
+	writeHex64(co, uint64(ino.mode))
+	writeASCII(co, " version=")
+	writeDec(co, uint64(ino.version))
+	writeASCII(co, " format=")
+	writeDec(co, uint64(ino.format))
+	writeASCII(co, " size=")
+	writeDec(co, ino.size)
+	writeASCII(co, " nextents=")
+	writeDec(co, uint64(ino.nextents))
+	writeASCII(co, "\r\n")
+}
 
 // detectFilesystem reads the first 4 KiB of a partition and reports
 // what it looks like. Heuristics:
@@ -1814,10 +1952,23 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 		// Stash context so detectFilesystem's ext4 branch can issue
 		// a follow-up GDT read without plumbing the args through.
 		lastSBValid = false
+		lastXfsSBValid = false
 		lastBIO = bioHolder
 		lastMediaId = media.mediaId
 		lastDevBlkSz = media.blockSize
 		detectFilesystem(co, probeBuf[:])
+		if lastXfsSBValid {
+			if readXfsInode(co, lastBIO, lastMediaId, lastDevBlkSz, &lastXfsSB, lastXfsSB.rootIno) {
+				var rino xfsInode
+				if parseXfsInode(xfsInodeBuf[:], &rino) {
+					printXfsInode(co, &rino)
+				} else {
+					writeASCII(co, "    xfs root inode parse failed\r\n")
+				}
+			} else {
+				writeASCII(co, "    xfs root inode read failed\r\n")
+			}
+		}
 		if lastSBValid {
 			ext4InspectGroupDesc(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB)
 			bootIno, _, ok := findInDir(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB,
