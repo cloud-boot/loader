@@ -1521,6 +1521,107 @@ func ext4InspectGroupDesc(co *efiSimpleTextOutput, bio uintptr, mediaId, blkSize
 	writeASCII(co, "\r\n")
 }
 
+// ----- xfs superblock parsing -----
+//
+// The xfs SB lives at byte 0 of the partition. All on-disk integers
+// are BIG-endian (the opposite of ext4). Only the fields we need to
+// reach an inode and walk extents are pulled out here; everything
+// else is reachable by raw offset.
+//
+// Format reference: xfs/libxfs/xfs_format.h in the kernel.
+
+type xfsSB struct {
+	magic       uint32 // 0x00 "XFSB" = 0x58465342
+	blockSize   uint32 // 0x04
+	dblocks     uint64 // 0x08  total data blocks
+	rblocks     uint64 // 0x10
+	rextents    uint64 // 0x18
+	uuid        [16]byte
+	logstart    uint64
+	rootIno     uint64 // 0x38  root inode number
+	rbmino      uint64
+	rsumino     uint64
+	rextsize    uint32
+	agblocks    uint32 // 0x54  blocks per AG
+	agcount     uint32 // 0x58  number of AGs
+	rbmblocks   uint32
+	logblocks   uint32
+	versionnum  uint16 // 0x64  v4 = 4 | features; v5 = 5
+	sectsize    uint16
+	inodesize   uint16 // 0x68
+	inopblock   uint16 // 0x6A  inodes per block
+	// then 12 bytes fsname[12]
+	blocklog    uint8 // 0x78  log2(blockSize)
+	sectlog     uint8
+	inodelog    uint8 // 0x7A  log2(inodesize)
+	inopblog    uint8 // 0x7B  log2(inopblock)
+	agblklog    uint8 // 0x7C  log2(agblocks rounded up)
+	// rest skipped
+}
+
+const xfsMagic uint32 = 0x58465342 // "XFSB"
+
+func be16(b []byte) uint16 { return uint16(b[1]) | uint16(b[0])<<8 }
+func be32(b []byte) uint32 {
+	return uint32(b[3]) | uint32(b[2])<<8 | uint32(b[1])<<16 | uint32(b[0])<<24
+}
+func be64(b []byte) uint64 {
+	return uint64(b[7]) | uint64(b[6])<<8 | uint64(b[5])<<16 | uint64(b[4])<<24 |
+		uint64(b[3])<<32 | uint64(b[2])<<40 | uint64(b[1])<<48 | uint64(b[0])<<56
+}
+
+func parseXfsSB(data []byte, sb *xfsSB) bool {
+	if len(data) < 0x80 {
+		return false
+	}
+	sb.magic = be32(data[0x00:])
+	if sb.magic != xfsMagic {
+		return false
+	}
+	sb.blockSize = be32(data[0x04:])
+	sb.dblocks = be64(data[0x08:])
+	sb.rootIno = be64(data[0x38:])
+	sb.agblocks = be32(data[0x54:])
+	sb.agcount = be32(data[0x58:])
+	sb.versionnum = be16(data[0x64:])
+	sb.sectsize = be16(data[0x66:])
+	sb.inodesize = be16(data[0x68:])
+	sb.inopblock = be16(data[0x6A:])
+	sb.blocklog = data[0x78]
+	sb.sectlog = data[0x79]
+	sb.inodelog = data[0x7A]
+	sb.inopblog = data[0x7B]
+	sb.agblklog = data[0x7C]
+	return true
+}
+
+func printXfsSB(co *efiSimpleTextOutput, sb *xfsSB) {
+	writeASCII(co, "    xfs SB: blockSize=")
+	writeDec(co, uint64(sb.blockSize))
+	writeASCII(co, " inodeSize=")
+	writeDec(co, uint64(sb.inodesize))
+	writeASCII(co, " inopblock=")
+	writeDec(co, uint64(sb.inopblock))
+	writeASCII(co, "\r\n    agblocks=")
+	writeDec(co, uint64(sb.agblocks))
+	writeASCII(co, " agcount=")
+	writeDec(co, uint64(sb.agcount))
+	writeASCII(co, " rootIno=")
+	writeDec(co, sb.rootIno)
+	writeASCII(co, "\r\n    version=")
+	writeHex64(co, uint64(sb.versionnum))
+	writeASCII(co, " inopblog=")
+	writeDec(co, uint64(sb.inopblog))
+	writeASCII(co, " agblklog=")
+	writeDec(co, uint64(sb.agblklog))
+	writeASCII(co, "\r\n")
+}
+
+var (
+	lastXfsSB      xfsSB
+	lastXfsSBValid bool
+)
+
 // detectFilesystem reads the first 4 KiB of a partition and reports
 // what it looks like. Heuristics:
 //
@@ -1604,6 +1705,16 @@ func detectFilesystem(co *efiSimpleTextOutput, data []byte) {
 			writeASCII(co, ")\r\n")
 			return
 		}
+	}
+
+	// xfs magic at byte 0.
+	if len(data) >= 0x80 && be32(data[0:]) == xfsMagic {
+		writeASCII(co, "    fs: xfs\r\n")
+		if parseXfsSB(data, &lastXfsSB) {
+			lastXfsSBValid = true
+			printXfsSB(co, &lastXfsSB)
+		}
+		return
 	}
 
 	writeASCII(co, "    fs: unknown (first 8 bytes = ")
