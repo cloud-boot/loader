@@ -750,6 +750,297 @@ var nameScratch [255]byte
 // works against a real cloud image.
 var bootNameBuf = [...]byte{'b', 'o', 'o', 't'}
 
+// vmlinuzPrefix is the byte-for-byte prefix every Linux distribution
+// uses for its EFI-stubbed kernel under /boot. The "-" terminator
+// avoids matching shadow files like "vmlinuz.old" or "vmlinuz.tmp".
+var vmlinuzPrefix = [...]byte{'v', 'm', 'l', 'i', 'n', 'u', 'z', '-'}
+
+// kernelName is filled by findInDirPrefix when a vmlinuz-* match is
+// found; the full filename is read out so the rest of the loader can
+// reference / log it. 255 = max ext4 dir_entry name length.
+var (
+	kernelName    [255]byte
+	kernelNameLen int
+
+	// AllocatePool holder for the kernel image buffer.
+	kernelBufPtr uintptr
+)
+
+// findInDirPrefix scans `dirIno` for the first entry whose name
+// starts with `prefix`. Useful for the kernel/initrd lookup since
+// the version suffix changes between distro images.
+func findInDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *ext4SB, dirIno uint32, prefix []byte,
+	outNameBuf *[255]byte, outNameLen *int,
+) (childIno uint32, fileType uint8, found bool) {
+	if !readInode(co, bio, mediaId, devBlkSz, sb, dirIno) ||
+		!snapshotInodeExtents() {
+		return 0, 0, false
+	}
+	maxBlocks := uint32(inodeSizeBytes / sb.blockSize)
+	if uint64(maxBlocks)*sb.blockSize < inodeSizeBytes {
+		maxBlocks++
+	}
+	if maxBlocks > inodeDirMaxBlocks {
+		maxBlocks = inodeDirMaxBlocks
+	}
+	for b := uint32(0); b < maxBlocks; b++ {
+		if !readDataBlock(co, bio, mediaId, devBlkSz, sb, b, &dirBuf) {
+			continue
+		}
+		off := uint32(0)
+		for off+8 <= uint32(sb.blockSize) {
+			ent := le32(dirBuf[off:])
+			recLen := uint32(le16(dirBuf[off+4:]))
+			nameLen := uint32(dirBuf[off+6])
+			ft := dirBuf[off+7]
+			if recLen == 0 || recLen < 8 || off+recLen > uint32(sb.blockSize) {
+				break
+			}
+			if ent != 0 && nameLen >= uint32(len(prefix)) {
+				match := true
+				for i := 0; i < len(prefix); i++ {
+					if dirBuf[off+8+uint32(i)] != prefix[i] {
+						match = false
+						break
+					}
+				}
+				if match {
+					// Copy the full name out for the caller.
+					n := int(nameLen)
+					if n > len(outNameBuf) {
+						n = len(outNameBuf)
+					}
+					for i := 0; i < n; i++ {
+						outNameBuf[i] = dirBuf[off+8+uint32(i)]
+					}
+					*outNameLen = n
+					return ent, ft, true
+				}
+			}
+			off += recLen
+		}
+	}
+	return 0, 0, false
+}
+
+// ----- extent tree walking for file reads -----
+//
+// readFile handles depth-0 (inline leaves in i_block) and depth-1
+// (i_block has extent-index entries pointing at leaf blocks) trees.
+// That covers any file up to ~5 GiB even on 4-KiB blocks
+// (4 inline idx × 340 leaves/block × 32 768 blocks/leaf × 4 KiB).
+//
+// For each leaf extent we ReadBlocks `len` blocks straight into
+// out + logical*blockSize. The destination buffer must be at least
+// the inode's data size.
+
+// extentLeafBuf is the scratch for one extent-tree leaf block when
+// walking depth-1 trees. Separate from dirBuf so an outer caller can
+// keep dirBuf live across this call (not needed today, but cheap).
+var extentLeafBuf [4096]byte
+
+// readFile reads the entire content of inode `inoNum` into the
+// caller-allocated buffer at `outAddr` (size = `outCap`). Returns
+// the number of bytes written.
+func readFile(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *ext4SB, inoNum uint32, outAddr uintptr, outCap uint64,
+) uint64 {
+	if !readInode(co, bio, mediaId, devBlkSz, sb, inoNum) {
+		writeASCII(co, "    readFile: read inode failed\r\n")
+		return 0
+	}
+	var ino ext4Inode
+	if !parseInode(rawInodeBuf[:], &ino) {
+		return 0
+	}
+	fileSize := (uint64(ino.sizeHi) << 32) | uint64(ino.sizeLo)
+	if fileSize > outCap {
+		writeASCII(co, "    readFile: file too big for buffer\r\n")
+		return 0
+	}
+	iblock := rawInodeBuf[inodeBlockOff : inodeBlockOff+inodeBlockSize]
+	var eh extentHeader
+	if !parseExtentHeader(iblock, &eh) {
+		writeASCII(co, "    readFile: bad extent header\r\n")
+		return 0
+	}
+	switch eh.depth {
+	case 0:
+		// Inline leaves — same shape snapshotInodeExtents handles.
+		for i := uint16(0); i < eh.entries; i++ {
+			off := 12 + int(i)*12
+			eeBlock := le32(iblock[off+0:])
+			eeLen := le16(iblock[off+4:])
+			eeStartHi := le16(iblock[off+6:])
+			eeStartLo := le32(iblock[off+8:])
+			physStart := (uint64(eeStartHi) << 32) | uint64(eeStartLo)
+			if !readExtentRange(co, bio, mediaId, devBlkSz, sb,
+				physStart, uint64(eeLen),
+				outAddr+uintptr(eeBlock)*uintptr(sb.blockSize)) {
+				return 0
+			}
+		}
+	case 1:
+		// i_block holds up to 4 extent_idx entries. Each leaf block
+		// is one filesystem block (4 KiB), itself an extent_header
+		// followed by depth-0 leaves.
+		for i := uint16(0); i < eh.entries; i++ {
+			off := 12 + int(i)*12
+			eiLeafLo := le32(iblock[off+4:])
+			eiLeafHi := le16(iblock[off+8:])
+			eiLeaf := (uint64(eiLeafHi) << 32) | uint64(eiLeafLo)
+			leafLBA := eiLeaf * sb.blockSize / uint64(devBlkSz)
+			for k := 0; k < len(extentLeafBuf); k++ {
+				extentLeafBuf[k] = 0
+			}
+			if rst := readBlocks(bio, mediaId, leafLBA, uintptr(sb.blockSize),
+				uintptr(unsafe.Pointer(&extentLeafBuf[0]))); rst != efiSuccess {
+				writeASCII(co, "    readFile: leaf read failed\r\n")
+				return 0
+			}
+			var leafEh extentHeader
+			if !parseExtentHeader(extentLeafBuf[:], &leafEh) {
+				writeASCII(co, "    readFile: bad leaf magic\r\n")
+				return 0
+			}
+			if leafEh.depth != 0 {
+				writeASCII(co, "    readFile: depth>1 not implemented\r\n")
+				return 0
+			}
+			for j := uint16(0); j < leafEh.entries; j++ {
+				eoff := 12 + int(j)*12
+				eeBlock := le32(extentLeafBuf[eoff+0:])
+				eeLen := le16(extentLeafBuf[eoff+4:])
+				eeStartHi := le16(extentLeafBuf[eoff+6:])
+				eeStartLo := le32(extentLeafBuf[eoff+8:])
+				physStart := (uint64(eeStartHi) << 32) | uint64(eeStartLo)
+				if !readExtentRange(co, bio, mediaId, devBlkSz, sb,
+					physStart, uint64(eeLen),
+					outAddr+uintptr(eeBlock)*uintptr(sb.blockSize)) {
+					return 0
+				}
+			}
+		}
+	default:
+		writeASCII(co, "    readFile: depth>1 not supported yet\r\n")
+		return 0
+	}
+	return fileSize
+}
+
+// readKernel resolves the kernel inode, AllocatePool's a buffer of
+// the right size from EfiLoaderData, reads every data block through
+// the extent walker, then sanity-checks the result by looking for
+// "MZ" at offset 0 (the PE/COFF stub at the head of every Linux
+// EFI-stubbed kernel) and the canonical Linux 0x40 "PE\0\0" pointer.
+const (
+	efiLoaderData uintptr = 2
+)
+
+func readKernel(co *efiSimpleTextOutput, bs *efiBootServices,
+	bio uintptr, mediaId, devBlkSz uint32, sb *ext4SB, inoNum uint32,
+) {
+	// Need the size first — read the inode just to extract it.
+	if !readInode(co, bio, mediaId, devBlkSz, sb, inoNum) {
+		writeASCII(co, "    readKernel: read inode failed\r\n")
+		return
+	}
+	var ino ext4Inode
+	if !parseInode(rawInodeBuf[:], &ino) {
+		return
+	}
+	fileSize := (uint64(ino.sizeHi) << 32) | uint64(ino.sizeLo)
+	writeASCII(co, "    kernel size = ")
+	writeDec(co, fileSize)
+	writeASCII(co, " bytes\r\n")
+
+	// AllocatePool(EfiLoaderData, fileSize, &kernelBufPtr).
+	kernelBufPtr = 0
+	st := efiCall3(bs.allocatePool,
+		efiLoaderData,
+		uintptr(fileSize),
+		uintptr(unsafe.Pointer(&kernelBufPtr)))
+	if st != efiSuccess || kernelBufPtr == 0 {
+		writeASCII(co, "    AllocatePool failed: ")
+		writeHex64(co, st)
+		writeASCII(co, "\r\n")
+		return
+	}
+	writeASCII(co, "    AllocatePool OK, buf=")
+	writeHex64(co, uint64(kernelBufPtr))
+	writeASCII(co, "\r\n")
+
+	got := readFile(co, bio, mediaId, devBlkSz, sb, inoNum,
+		kernelBufPtr, fileSize)
+	if got == 0 {
+		writeASCII(co, "    readFile returned 0 bytes\r\n")
+		return
+	}
+	writeASCII(co, "    readFile OK, ")
+	writeDec(co, got)
+	writeASCII(co, " bytes\r\n")
+
+	// PE/COFF sanity check: first two bytes must be "MZ"; the LE u32
+	// at offset 0x3C points at the "PE\0\0" signature.
+	b0 := *(*byte)(unsafe.Pointer(kernelBufPtr))
+	b1 := *(*byte)(unsafe.Pointer(kernelBufPtr + 1))
+	writeASCII(co, "    bytes[0..2] = ")
+	writeHex64(co, uint64(b0))
+	writeASCII(co, " ")
+	writeHex64(co, uint64(b1))
+	if b0 == 'M' && b1 == 'Z' {
+		writeASCII(co, " (MZ ✓)")
+	}
+	writeASCII(co, "\r\n")
+	peOff := uint32(*(*byte)(unsafe.Pointer(kernelBufPtr + 0x3C))) |
+		uint32(*(*byte)(unsafe.Pointer(kernelBufPtr + 0x3D)))<<8 |
+		uint32(*(*byte)(unsafe.Pointer(kernelBufPtr + 0x3E)))<<16 |
+		uint32(*(*byte)(unsafe.Pointer(kernelBufPtr + 0x3F)))<<24
+	writeASCII(co, "    PE offset = ")
+	writeHex64(co, uint64(peOff))
+	if peOff < uint32(fileSize)-4 {
+		pe0 := *(*byte)(unsafe.Pointer(kernelBufPtr + uintptr(peOff)))
+		pe1 := *(*byte)(unsafe.Pointer(kernelBufPtr + uintptr(peOff) + 1))
+		pe2 := *(*byte)(unsafe.Pointer(kernelBufPtr + uintptr(peOff) + 2))
+		pe3 := *(*byte)(unsafe.Pointer(kernelBufPtr + uintptr(peOff) + 3))
+		writeASCII(co, " sig=")
+		writeHex64(co, uint64(pe0))
+		writeASCII(co, " ")
+		writeHex64(co, uint64(pe1))
+		writeASCII(co, " ")
+		writeHex64(co, uint64(pe2))
+		writeASCII(co, " ")
+		writeHex64(co, uint64(pe3))
+		if pe0 == 'P' && pe1 == 'E' && pe2 == 0 && pe3 == 0 {
+			writeASCII(co, " (PE\\0\\0 ✓)")
+		}
+	}
+	writeASCII(co, "\r\n")
+}
+
+// readExtentRange ReadBlocks `numBlocks` filesystem blocks starting
+// at physical block `physStart` into `dst`. Chunks the call as
+// needed since some firmwares cap a single ReadBlocks at the device
+// block-window size — but BLOCK_IO has no documented max.
+func readExtentRange(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	sb *ext4SB, physStart, numBlocks uint64, dst uintptr,
+) bool {
+	if numBlocks == 0 {
+		return true
+	}
+	lba := physStart * sb.blockSize / uint64(devBlkSz)
+	bytes := numBlocks * sb.blockSize
+	rst := readBlocks(bio, mediaId, lba, uintptr(bytes), dst)
+	if rst != efiSuccess {
+		writeASCII(co, "    readExtentRange: ReadBlocks failed: ")
+		writeHex64(co, rst)
+		writeASCII(co, "\r\n")
+		return false
+	}
+	return true
+}
+
 // listDir prints every name in `dirIno`. Diagnostic helper — Step 5
 // will replace this with a name-matching pass that locates a kernel
 // like "vmlinuz-6.1.0-cloud-arm64".
@@ -1087,20 +1378,29 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 		detectFilesystem(co, probeBuf[:])
 		if lastSBValid {
 			ext4InspectGroupDesc(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB)
-			// Find /boot via a single findInDir call from root (#2).
-			// resolvePath is reserved for the multi-component case
-			// once this baseline is proven.
-			bootIno, bootFT, ok := findInDir(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB,
+			bootIno, _, ok := findInDir(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB,
 				2, bootNameBuf[:4])
-			if ok {
-				writeASCII(co, "    /boot inode=")
-				writeDec(co, uint64(bootIno))
-				writeASCII(co, " fileType=")
-				writeDec(co, uint64(bootFT))
-				writeASCII(co, "\r\n")
-				listDir(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB, bootIno)
-			} else {
+			if !ok {
 				writeASCII(co, "    /boot: not found in root\r\n")
+			} else {
+				// Find /boot/vmlinuz-* by prefix.
+				kIno, kFT, kOK := findInDirPrefix(co, lastBIO, lastMediaId, lastDevBlkSz, &lastSB,
+					bootIno, vmlinuzPrefix[:], &kernelName, &kernelNameLen)
+				if !kOK {
+					writeASCII(co, "    no vmlinuz-* in /boot\r\n")
+				} else {
+					writeASCII(co, "    kernel: ")
+					for i := 0; i < kernelNameLen; i++ {
+						oneCharBuf[0] = kernelName[i]
+						writeASCII(co, oneCharStr)
+					}
+					writeASCII(co, " (inode=")
+					writeDec(co, uint64(kIno))
+					writeASCII(co, " ft=")
+					writeDec(co, uint64(kFT))
+					writeASCII(co, ")\r\n")
+					readKernel(co, bs, lastBIO, lastMediaId, lastDevBlkSz, &lastSB, kIno)
+				}
 			}
 		}
 	}
