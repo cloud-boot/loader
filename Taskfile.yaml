@@ -210,12 +210,24 @@ tasks:
   # The OVMF varstore is wiped on every run — OVMF caches a Boot0001
   # entry across reboots that points at the *previous* ESP and will
   # short-circuit the removable-media fallback unless reset.
+  efivar-stage:
+    desc: Build the host-side OVMF varstore staging tool.
+    dir: cmd/efivar-stage
+    sources: [main.go, go.mod]
+    generates: [efivar-stage]
+    cmds:
+      - go build -o efivar-stage .
+
   qemu-loader-arm64:
     desc: Boot the disk-mode loader under qemu-system-aarch64 / OVMF.
-    deps: [loader-arm64]
+    deps: [loader-arm64, efivar-stage]
     dir: cmd/efi-loader
     vars:
       UKI_PATH: '{{.UKI_PATH | default "../efi-probe/BOOTAA64-probe.EFI"}}'
+      # CMDLINE is staged into the OVMF varstore via efivar-stage; the
+      # loader picks it up via RuntimeServices.GetVariable. Override to
+      # exercise the real kernel cmdline you'd want a UKI to receive.
+      CMDLINE: '{{.CMDLINE | default "cloud-boot: hello from CloudBootCmdline EFI var"}}'
     cmds:
       - rm -f esp.img ovmf_vars_arm64.fd
       - dd if=/dev/zero of=ovmf_vars_arm64.fd bs=1M count=64 status=none
@@ -232,6 +244,10 @@ tasks:
         else
           echo "WARNING: {{.UKI_PATH}} not found — loader will report 'no UKI found'";
         fi
+      # Stage CloudBootCmdline into the OVMF varstore. The loader's
+      # readCmdlineEFIVar (RuntimeServices.GetVariable) picks it up
+      # at boot.
+      - ../efivar-stage/efivar-stage -store ovmf_vars_arm64.fd -cmdline "{{.CMDLINE}}"
       - >-
         qemu-system-aarch64
         -machine virt,gic-version=max,accel=hvf:tcg -cpu max -m 1024 -smp 2
@@ -246,3 +262,4 @@ tasks:
       - rm -f cmd/efi-probe/*.o cmd/efi-probe/*.EFI cmd/efi-probe/esp.img cmd/efi-probe/ovmf_vars_arm64.fd
       - rm -f cmd/efi-loader/*.o cmd/efi-loader/*.EFI cmd/efi-loader/esp.img cmd/efi-loader/ovmf_vars_arm64.fd
       - rm -rf cmd/efi-loader/esp-stage cmd/efi-loader/esp-loader.iso
+      - rm -f cmd/efivar-stage/efivar-stage

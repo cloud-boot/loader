@@ -96,15 +96,42 @@ type efiSystemTable struct {
 	hdr               efiTableHeader
 	firmwareVendor    uintptr
 	firmwareRevision  uint32
+	_pad              uint32
 	consoleInHandle   uintptr
 	conIn             uintptr
 	consoleOutHandle  uintptr
 	conOut            *efiSimpleTextOutput
 	standardErrHandle uintptr
 	stdErr            uintptr
-	runtimeServices   uintptr
+	runtimeServices   *efiRuntimeServices
 	bootServices      *efiBootServices
 }
+
+// efiRuntimeServices — laid out in UEFI 2.10 §4.5 order. We only call
+// GetVariable, but keep the upstream fields so the offset matches.
+type efiRuntimeServices struct {
+	hdr efiTableHeader
+
+	getTime       uintptr
+	setTime       uintptr
+	getWakeupTime uintptr
+	setWakeupTime uintptr
+
+	setVirtualAddressMap uintptr
+	convertPointer       uintptr
+
+	getVariable          uintptr // 5 args
+	getNextVariableName  uintptr
+	setVariable          uintptr
+
+	getNextHighMonotonicCount uintptr
+	resetSystem               uintptr
+}
+
+// EFI_BUFFER_TOO_SMALL — returned by GetVariable when the supplied
+// buffer is too small; the call writes the required size back into
+// `DataSize`. The standard two-pass GetVariable idiom relies on this.
+const efiBufferTooSmall efiStatus = 0x8000000000000005
 
 // EFI_SIMPLE_FILE_SYSTEM_PROTOCOL — only the OpenVolume slot matters.
 //
@@ -114,6 +141,45 @@ type efiSystemTable struct {
 type efiSimpleFileSystem struct {
 	revision   uint64
 	openVolume uintptr
+}
+
+// EFI_LOADED_IMAGE_PROTOCOL — what the firmware installs on every
+// handle returned by LoadImage. We only patch two fields after
+// LoadImage and before StartImage: LoadOptions (UTF-16LE buffer) and
+// LoadOptionsSize (BYTES, sized for that buffer). Linux's EFI stub
+// reads its kernel command line from those slots.
+//
+// Layout (UEFI 2.10 §9.1):
+//
+//	UINT32             Revision;            // 0x00
+//	EFI_HANDLE         ParentHandle;        // 0x08
+//	EFI_SYSTEM_TABLE  *SystemTable;         // 0x10
+//	EFI_HANDLE         DeviceHandle;        // 0x18
+//	EFI_DEVICE_PATH   *FilePath;            // 0x20
+//	VOID              *Reserved;            // 0x28
+//	UINT32             LoadOptionsSize;     // 0x30  ← bytes
+//	VOID              *LoadOptions;         // 0x38  ← UTF-16LE
+//	VOID              *ImageBase;           // 0x40
+//	UINT64             ImageSize;           // 0x48
+//	EFI_MEMORY_TYPE    ImageCodeType;       // 0x50
+//	EFI_MEMORY_TYPE    ImageDataType;       // 0x54
+//	EFI_IMAGE_UNLOAD   Unload;              // 0x58
+type efiLoadedImageProtocol struct {
+	revision        uint32
+	_pad            uint32
+	parentHandle    uintptr
+	systemTable     uintptr
+	deviceHandle    uintptr
+	filePath        uintptr
+	_reserved       uintptr
+	loadOptionsSize uint32
+	_pad2           uint32
+	loadOptions     uintptr
+	imageBase       uintptr
+	imageSize       uint64
+	imageCodeType   uint32
+	imageDataType   uint32
+	unload          uintptr
 }
 
 // EFI_FILE_PROTOCOL — fields we actually call. Rev1 layout is enough.
@@ -157,7 +223,36 @@ var (
 		0xD2, 0x11,
 		0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B,
 	}
+	// EFI_LOADED_IMAGE_PROTOCOL_GUID — 5b1b31a1-9562-11d2-8e3f-00a0c969723b
+	loadedImageGUID = efiGUID{
+		0xA1, 0x31, 0x1B, 0x5B,
+		0x62, 0x95,
+		0xD2, 0x11,
+		0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B,
+	}
+
+	// cloud-boot vendor GUID — namespace for cloud-boot-specific UEFI
+	// variables ("CloudBootCmdline", future "CloudBootTarget", …).
+	//
+	//   {c10ddb07-83c5-4d3e-9b76-1f4c0e7a3b8e}
+	//
+	// Generated once, stable across releases. Host-side
+	// `loader/cmd/efivar-stage` writes variables under this GUID; the
+	// loader's GetVariable calls pass the same GUID.
+	cloudBootGUID = efiGUID{
+		0x07, 0xDB, 0x0D, 0xC1,
+		0xC5, 0x83,
+		0x3E, 0x4D,
+		0x9B, 0x76, 0x1F, 0x4C, 0x0E, 0x7A, 0x3B, 0x8E,
+	}
 )
+
+// "CloudBootCmdline" — UTF-16LE, NUL-terminated. Pre-encoded so we
+// don't allocate at runtime.
+var cmdlineVarName = [...]uint16{
+	'C', 'l', 'o', 'u', 'd', 'B', 'o', 'o', 't', 'C', 'm', 'd', 'l', 'i', 'n', 'e',
+	0,
+}
 
 // ----- asm thunks (defined in thunk-arm64.S / thunk-amd64.S) -----
 
@@ -260,7 +355,277 @@ var (
 		'\\', 'c', 'l', 'o', 'u', 'd', '-', 'b', 'o', 'o', 't', '.', 'e', 'f', 'i',
 		0,
 	}
+
+	// Cmdline source path. ASCII bytes, one line, trailing newline
+	// tolerated. "\cmdline" at the FAT root — same convention
+	// systemd-boot's loader.conf uses, with the simplification of
+	// not requiring a [config] header.
+	//
+	// "\cmdline"
+	cmdlinePath = [...]uint16{
+		'\\', 'c', 'm', 'd', 'l', 'i', 'n', 'e',
+		0,
+	}
+
+	// Holder for Open("\cmdline").
+	cmdlineFileHolder uintptr
+
+	// AllocatePool buffer for the raw ASCII bytes.
+	cmdlineRawBuf uintptr
+	cmdlineRawLen uintptr
+	cmdlinePos    uint64
+
+	// UTF-16 buffer used to back the child kernel's LoadOptions. Sized
+	// for a hefty cmdline (4096 chars = 8 KiB) and kept in BSS so its
+	// address survives ExitBootServices the same way every other
+	// firmware-facing pointer here does.
+	cmdlineUTF16 [4096]uint16
+	cmdlineChars uint32 // number of UTF-16 code units written (excl. NUL)
+
+	// Loaded-image lookup for the chain-loaded child — used by the
+	// cmdline patch.
+	childLIPHolder uintptr
+
+	// Scratch byte-count slot for GetVariable / EFI_FILE.Read. Lives in
+	// BSS so its address can be handed to firmware via unsafe.Pointer
+	// without triggering TinyGo's escape-to-heap path — which would
+	// reach runtime.alloc → VirtualAlloc and crash here.
+	scratchSize uintptr
 )
+
+// readCmdlineEFIVar fetches the host-staged cmdline from the
+// `CloudBootCmdline` UEFI variable under the cloud-boot vendor GUID.
+// This is the primary cmdline source — the host pre-populates the
+// variable via `loader/cmd/efivar-stage` (which uses the host-side
+// github.com/go-filesystems/uefi package to write into OVMF_VARS.fd
+// before QEMU launches). Returns true on success; falls through to
+// the disk-file fallback otherwise.
+//
+// EFI's GetVariable uses the classic two-call idiom: first probe with
+// DataSize=0 → EFI_BUFFER_TOO_SMALL (and the actual size written
+// back), then allocate + read.
+func readCmdlineEFIVar(co *efiSimpleTextOutput, bs *efiBootServices, rt *efiRuntimeServices) bool {
+	if rt == nil || rt.getVariable == 0 {
+		return false
+	}
+
+	// Probe pass — DataSize=0, Data=NULL.
+	cmdlineRawLen = 0
+	st := efiCall5(rt.getVariable,
+		uintptr(unsafe.Pointer(&cmdlineVarName[0])),
+		uintptr(unsafe.Pointer(&cloudBootGUID)),
+		0, // Attributes (optional)
+		uintptr(unsafe.Pointer(&cmdlineRawLen)),
+		0)
+	if st != efiBufferTooSmall {
+		// EFI_NOT_FOUND etc. — the host didn't stage a variable.
+		return false
+	}
+	if cmdlineRawLen == 0 {
+		return false
+	}
+
+	// Reserve one slot for the NUL terminator in cmdlineUTF16. The
+	// data we read is ASCII (1 byte per char), so the resulting
+	// UTF-16 widening uses the same character count.
+	maxRaw := uintptr(len(cmdlineUTF16) - 1)
+	if cmdlineRawLen > maxRaw {
+		cmdlineRawLen = maxRaw
+	}
+
+	cmdlineRawBuf = 0
+	st = efiCall3(bs.allocatePool,
+		efiLoaderData,
+		cmdlineRawLen,
+		uintptr(unsafe.Pointer(&cmdlineRawBuf)))
+	if st != efiSuccess {
+		return false
+	}
+
+	scratchSize = cmdlineRawLen
+	st = efiCall5(rt.getVariable,
+		uintptr(unsafe.Pointer(&cmdlineVarName[0])),
+		uintptr(unsafe.Pointer(&cloudBootGUID)),
+		0,
+		uintptr(unsafe.Pointer(&scratchSize)),
+		cmdlineRawBuf)
+	if st != efiSuccess || scratchSize == 0 {
+		efiCall1(bs.freePool, cmdlineRawBuf)
+		return false
+	}
+
+	// Trim trailing CR / LF / whitespace.
+	for scratchSize > 0 {
+		b := *(*byte)(unsafe.Pointer(cmdlineRawBuf + scratchSize - 1))
+		if b != '\r' && b != '\n' && b != ' ' && b != '\t' && b != 0 {
+			break
+		}
+		scratchSize--
+	}
+	if scratchSize == 0 {
+		efiCall1(bs.freePool, cmdlineRawBuf)
+		return false
+	}
+
+	for i := uintptr(0); i < scratchSize; i++ {
+		cmdlineUTF16[i] = uint16(*(*byte)(unsafe.Pointer(cmdlineRawBuf + i)))
+	}
+	cmdlineUTF16[scratchSize] = 0
+	cmdlineChars = uint32(scratchSize)
+
+	efiCall1(bs.freePool, cmdlineRawBuf)
+
+	writeASCII(co, "  cmdline from EFI var CloudBootCmdline (")
+	writeHex64(co, uint64(cmdlineChars))
+	writeASCII(co, " chars): ")
+	for i := uint32(0); i < cmdlineChars; i++ {
+		oneCharBuf[0] = byte(cmdlineUTF16[i])
+		writeASCII(co, oneCharStr)
+	}
+	writeASCII(co, "\r\n")
+	return true
+}
+
+// readCmdline opens `\cmdline` at the volume root, reads up to the
+// cmdlineUTF16 capacity, and widens the ASCII bytes to UTF-16LE in
+// cmdlineUTF16. Trailing CR/LF/whitespace is stripped; the buffer is
+// NUL-terminated. Sets cmdlineChars to the code-unit count (excl. NUL).
+// Returns true if a non-empty cmdline was loaded.
+//
+// This is the disk-file fallback used only when no `CloudBootCmdline`
+// EFI variable was staged. On any error or missing file, returns false
+// — the caller falls back to LoadImage with the firmware's default
+// cmdline (= empty).
+func readCmdline(co *efiSimpleTextOutput, bs *efiBootServices, root *efiFile) bool {
+	cmdlineFileHolder = 0
+	st := efiCall5(root.open,
+		uintptr(unsafe.Pointer(root)),
+		uintptr(unsafe.Pointer(&cmdlineFileHolder)),
+		uintptr(unsafe.Pointer(&cmdlinePath[0])),
+		uintptr(efiFileModeRead),
+		0)
+	if st != efiSuccess {
+		return false
+	}
+	cf := (*efiFile)(unsafe.Pointer(cmdlineFileHolder))
+
+	// Size the file.
+	cmdlinePos = 0
+	st = efiCall2(cf.setPosition, cmdlineFileHolder, uintptr(efiFilePositionEnd))
+	if st != efiSuccess {
+		efiCall1(cf.close, cmdlineFileHolder)
+		return false
+	}
+	st = efiCall2(cf.getPosition, cmdlineFileHolder, uintptr(unsafe.Pointer(&cmdlinePos)))
+	if st != efiSuccess || cmdlinePos == 0 {
+		efiCall1(cf.close, cmdlineFileHolder)
+		return false
+	}
+	// Reserve one slot for the NUL terminator.
+	maxRaw := uint64(len(cmdlineUTF16) - 1)
+	if cmdlinePos > maxRaw {
+		cmdlinePos = maxRaw
+	}
+	cmdlineRawLen = uintptr(cmdlinePos)
+
+	st = efiCall2(cf.setPosition, cmdlineFileHolder, 0)
+	if st != efiSuccess {
+		efiCall1(cf.close, cmdlineFileHolder)
+		return false
+	}
+
+	// Allocate a scratch buffer for the raw ASCII bytes — we widen
+	// out of it into cmdlineUTF16 below.
+	cmdlineRawBuf = 0
+	st = efiCall3(bs.allocatePool,
+		efiLoaderData,
+		cmdlineRawLen,
+		uintptr(unsafe.Pointer(&cmdlineRawBuf)))
+	if st != efiSuccess {
+		efiCall1(cf.close, cmdlineFileHolder)
+		return false
+	}
+
+	scratchSize = cmdlineRawLen
+	st = efiCall3(cf.read,
+		cmdlineFileHolder,
+		uintptr(unsafe.Pointer(&scratchSize)),
+		cmdlineRawBuf)
+	efiCall1(cf.close, cmdlineFileHolder)
+	if st != efiSuccess || scratchSize == 0 {
+		efiCall1(bs.freePool, cmdlineRawBuf)
+		return false
+	}
+
+	// Trim trailing CR / LF / space — cmdline files often have a
+	// gratuitous newline from `echo ... > \cmdline`.
+	for scratchSize > 0 {
+		b := *(*byte)(unsafe.Pointer(cmdlineRawBuf + scratchSize - 1))
+		if b != '\r' && b != '\n' && b != ' ' && b != '\t' {
+			break
+		}
+		scratchSize--
+	}
+	if scratchSize == 0 {
+		efiCall1(bs.freePool, cmdlineRawBuf)
+		return false
+	}
+
+	// Widen ASCII → UTF-16LE.
+	for i := uintptr(0); i < scratchSize; i++ {
+		cmdlineUTF16[i] = uint16(*(*byte)(unsafe.Pointer(cmdlineRawBuf + i)))
+	}
+	cmdlineUTF16[scratchSize] = 0
+	cmdlineChars = uint32(scratchSize)
+
+	efiCall1(bs.freePool, cmdlineRawBuf)
+
+	writeASCII(co, "  cmdline (")
+	writeHex64(co, uint64(cmdlineChars))
+	writeASCII(co, " chars): ")
+	// Echo the ASCII (already validated as non-empty).
+	for i := uint32(0); i < cmdlineChars; i++ {
+		oneCharBuf[0] = byte(cmdlineUTF16[i])
+		writeASCII(co, oneCharStr)
+	}
+	writeASCII(co, "\r\n")
+	return true
+}
+
+// One-byte scratch "string" used to print ASCII chars through writeASCII
+// without allocating a fresh Go string per character.
+var oneCharBuf [1]byte
+var oneCharStr = unsafe.String(&oneCharBuf[0], 1)
+
+// patchChildCmdline installs cmdlineUTF16 on the chain-loaded image's
+// LoadedImage protocol so its EFI stub reads the right cmdline. Soft-
+// fails (logs + returns) when the protocol can't be fetched — the
+// kernel will boot with an empty cmdline, which is still useful for
+// triage. Mirrors the corresponding logic in go-coff/stub Phase 3c.
+func patchChildCmdline(co *efiSimpleTextOutput, bs *efiBootServices, childHandle uintptr) {
+	if cmdlineChars == 0 {
+		return
+	}
+	childLIPHolder = 0
+	st := efiCall3(bs.handleProtocol,
+		childHandle,
+		uintptr(unsafe.Pointer(&loadedImageGUID)),
+		uintptr(unsafe.Pointer(&childLIPHolder)))
+	if st != efiSuccess {
+		writeASCII(co, "  child HandleProtocol(LoadedImage) failed: ")
+		writeHex64(co, st)
+		writeASCII(co, " — booting with default cmdline\r\n")
+		return
+	}
+	childLip := (*efiLoadedImageProtocol)(unsafe.Pointer(childLIPHolder))
+	childLip.loadOptions = uintptr(unsafe.Pointer(&cmdlineUTF16[0]))
+	// Linux's EFI stub accepts either form (NUL-included or NUL-
+	// excluded). systemd-stub convention is bytes-with-NUL — match that.
+	childLip.loadOptionsSize = (cmdlineChars + 1) * 2
+	writeASCII(co, "  patched child LoadOptions (")
+	writeHex64(co, uint64(childLip.loadOptionsSize))
+	writeASCII(co, " bytes)\r\n")
+}
 
 // tryLoadFromHandle attempts to chain-load `\EFI\Linux\cloud-boot.efi`
 // from the SimpleFileSystem on `sfsHandle`. Returns true if LoadImage
@@ -297,14 +662,25 @@ func tryLoadFromHandle(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle
 		uintptr(unsafe.Pointer(&ukiPath[0])),
 		uintptr(efiFileModeRead),
 		0)
-	// Close root regardless — we're done with it.
-	efiCall1(root.close, rootFileHolder)
 	if st != efiSuccess {
 		// EFI_NOT_FOUND is the normal "this volume doesn't have our
-		// UKI" path; don't log it noisily.
+		// UKI" path; don't log it noisily. Close root before bailing.
+		efiCall1(root.close, rootFileHolder)
 		return false
 	}
 	kf := (*efiFile)(unsafe.Pointer(kernelFileHolder))
+
+	// Step 3a: opportunistically read \cmdline from the same volume —
+	// but ONLY if readCmdlineEFIVar didn't already populate one. The
+	// EFI variable wins over the disk file because the host can
+	// re-stage it without rebuilding the FAT image.
+	if cmdlineChars == 0 {
+		if readCmdline(co, bs, root) {
+			writeASCII(co, "cmdline source: \\cmdline file\r\n")
+		}
+	}
+	// Now done with root.
+	efiCall1(root.close, rootFileHolder)
 
 	// Step 4: find the file size via SetPosition(END) → GetPosition.
 	st = efiCall2(kf.setPosition, kernelFileHolder, uintptr(efiFilePositionEnd))
@@ -401,6 +777,10 @@ func tryLoadFromHandle(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle
 	writeASCII(co, "  LoadImage OK, child handle = ")
 	writeHex64(co, uint64(childImageHandle))
 	writeASCII(co, "\r\n")
+
+	// Step 9: propagate the cmdline (if any) into the child's
+	// LoadedImage protocol. Soft-fails — see patchChildCmdline.
+	patchChildCmdline(co, bs, childImageHandle)
 	return true
 }
 
@@ -408,8 +788,19 @@ func tryLoadFromHandle(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle
 func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	co := st.conOut
 	bs := st.bootServices
+	rt := st.runtimeServices
 
-	writeASCII(co, "cloud-boot/loader — disk-mode (phase 5a)\r\n")
+	writeASCII(co, "cloud-boot/loader — disk-mode (phase 5b)\r\n")
+
+	// Try the EFI-variable cmdline first. If the host staged
+	// `CloudBootCmdline` under cloudBootGUID via efivar-stage, it
+	// wins — no disk dependency for boot configuration. The disk
+	// `\cmdline` fallback still works for media that doesn't have
+	// host-side access to the OVMF varstore.
+	cmdlineChars = 0
+	if readCmdlineEFIVar(co, bs, rt) {
+		writeASCII(co, "cmdline source: EFI variable\r\n")
+	}
 
 	// Step 1: enumerate every SimpleFileSystem handle. ByProtocol
 	// search (SearchType=2) plus the EFI_SIMPLE_FILE_SYSTEM GUID

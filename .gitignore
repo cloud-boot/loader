@@ -17,5 +17,8 @@ esp-*/
 ovmf_vars*.fd
 nvram.bin
 
+# Host-side build outputs (Go binaries, not EFI).
+cmd/efivar-stage/efivar-stage
+
 # Taskfile run-state.
 .task/
