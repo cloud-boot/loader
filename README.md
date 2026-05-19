@@ -24,13 +24,14 @@ non-Linux EFI image works the same way.
 ## Phasing
 
 | Phase | Scope | Status |
-| ----- | ----- | ------ |
-| 0     | Probe `EFI_HTTP_PROTOCOL` / `EFI_TCP4_PROTOCOL` availability under Apple VZ + OVMF (arm64 + amd64) | done — see [Phase 0 result](#phase-0-result) |
-| 1     | TinyGo OCI v2 manifest+blob client over UEFI HTTP. Minimal JSON parse. | blocked by Phase 0 finding |
-| 2     | `LoadImage(SourceBuffer = fetched bytes)` + `StartImage` of distro kernel | — |
-| 3     | Dynamic `EFI_LOAD_FILE2_PROTOCOL` initrd from fetched bytes; cmdline propagation from plan | — |
-| 4     | DNS-SRV via `EFI_DNS4_PROTOCOL`; multi-endpoint failover; minimal cosign | — |
-| 5     | Disk-mode (`BlockIO` + `SimpleFileSystem` walk + cmdline from `/etc/kernel/cmdline`) | — |
+| --- | --- | --- |
+| 0 | Probe `EFI_HTTP_PROTOCOL` / `EFI_TCP4_PROTOCOL` availability under Apple VZ + OVMF (arm64 + amd64) | done — see [Phase 0 result](#phase-0-result) |
+| 1 | TinyGo OCI v2 manifest+blob client over UEFI HTTP. Minimal JSON parse. | blocked by Phase 0 finding |
+| 2 | `LoadImage(SourceBuffer = fetched bytes)` + `StartImage` of distro kernel | — |
+| 3 | Dynamic `EFI_LOAD_FILE2_PROTOCOL` initrd from fetched bytes; cmdline propagation from plan | — |
+| 4 | DNS-SRV via `EFI_DNS4_PROTOCOL`; multi-endpoint failover; minimal cosign | — |
+| 5a | Disk-mode minimal: SFS walk, open `\EFI\Linux\cloud-boot.efi`, `LoadImage` + `StartImage` | done — see [Phase 5a result](#phase-5a-result) |
+| 5b | Disk-mode + cmdline propagation, multiple candidate UKIs, fallback order | — |
 
 ## Phase 0 result
 
@@ -89,7 +90,65 @@ reports the situation honestly on firmware that doesn't.
   used by the build pipeline.
 - TinyGo (no GC / no scheduler).
 
-## Build
+## Phase 5a result
 
-(TBD — phase 0 has no build target yet; will land in
-`Taskfile.yaml` once the HTTP probe stub compiles.)
+[`cmd/efi-loader/main.go`](cmd/efi-loader/main.go) is a TinyGo PE/COFF
+binary that, on every EFI_SIMPLE_FILE_SYSTEM handle the firmware
+exposes:
+
+1. Calls `HandleProtocol(handle, SimpleFileSystem)` then `OpenVolume`
+   to reach the root EFI_FILE.
+2. Calls `EFI_FILE.Open("\EFI\Linux\cloud-boot.efi", READ)` and skips
+   the volume on `EFI_NOT_FOUND`.
+3. Sizes the file via `SetPosition(END)` + `GetPosition`, then rewinds.
+4. `BootServices.AllocatePool(EfiLoaderData, size, &buf)` and reads
+   the file into `buf`.
+5. `BootServices.LoadImage(BootPolicy=FALSE, SourceBuffer=buf, …)`.
+6. `BootServices.StartImage(childHandle, 0, 0)`.
+
+The loop short-circuits on the first volume that yields a valid UKI.
+
+End-to-end verification under QEMU + Homebrew OVMF (arm64,
+edk2-stable202408): a 64-MiB FAT32 ESP carrying the loader at
+`\EFI\BOOT\BOOTAA64.EFI` and the Phase-0 probe binary at
+`\EFI\Linux\cloud-boot.efi` (used as a stand-in target EFI app —
+small, with deterministic stdout) produces this transcript over
+the serial port:
+
+```text
+cloud-boot/loader — disk-mode (phase 5a)
+SimpleFileSystem handles: 0x0000000000000001
+  trying SFS handle 0x000000007F02CB18
+  found UKI, size = 0x0000000000002400      ← 9216 B probe binary
+  LoadImage OK, child handle = 0x000000007F000A18
+StartImage...
+cloud-boot/loader probe — phase 0          ← chained probe runs
+  connectAllNICs: 0x0000000000000001 handle(s)
+  …
+```
+
+The chained EFI image runs cleanly — the `LoadImage`/`StartImage`
+handoff path that Apple VZ supports natively (and that the existing
+kexec-based bootstrap fails on under arm64) works end-to-end.
+
+The Phase-0 probe is only a stand-in target; the real Phase 5b work
+is to substitute a Linux EFI-stub kernel (the existing `uki/`
+pipeline output) for the cloud-boot.efi slot, propagate
+`/etc/kernel/cmdline` into the child's `loaded-image->load_options`,
+and add a fallback order across multiple candidate UKIs.
+
+## Reproduce
+
+```sh
+task -t loader/Taskfile.yaml qemu-loader-arm64
+# defaults: UKI_PATH=cmd/efi-probe/BOOTAA64-probe.EFI
+
+UKI_PATH=/path/to/uki-aa64.efi \
+  task -t loader/Taskfile.yaml qemu-loader-arm64
+```
+
+The task wipes `ovmf_vars_arm64.fd` on each run — OVMF caches a
+Boot0001 entry across reboots that points at the *previous* ESP and
+short-circuits the removable-media fallback (`\EFI\BOOT\BOOTAA64.EFI`)
+unless reset. This was the longest-running gotcha during Phase 5a
+bring-up.

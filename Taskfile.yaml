@@ -8,10 +8,12 @@
 version: '3'
 
 vars:
-  PROBE_AMD64_OUT: BOOTX64-probe.EFI
-  PROBE_ARM64_OUT: BOOTAA64-probe.EFI
-  AMD64_TARGET:    targets/uefi-amd64.json
-  ARM64_TARGET:    targets/uefi-arm64.json
+  PROBE_AMD64_OUT:  BOOTX64-probe.EFI
+  PROBE_ARM64_OUT:  BOOTAA64-probe.EFI
+  LOADER_AMD64_OUT: BOOTX64.EFI
+  LOADER_ARM64_OUT: BOOTAA64.EFI
+  AMD64_TARGET:     targets/uefi-amd64.json
+  ARM64_TARGET:     targets/uefi-arm64.json
 
 tasks:
 
@@ -119,6 +121,128 @@ tasks:
         -netdev user,id=n0 -device virtio-net-device,netdev=n0
         -nographic -serial mon:stdio
 
+  # ----- loader (phase 5a — disk-mode) ------------------------------------
+
+  loader-thunk-arm64:
+    desc: Assemble the arm64 EFI calling-convention thunk for the loader.
+    dir: cmd/efi-loader
+    sources: [thunk-arm64.S]
+    generates: [thunk-arm64.o]
+    cmds:
+      - clang -target aarch64-pc-windows-gnu -c thunk-arm64.S -o thunk-arm64.o
+
+  loader-thunk-amd64:
+    desc: Assemble the amd64 EFI calling-convention thunk for the loader.
+    dir: cmd/efi-loader
+    sources: [thunk-amd64.S]
+    generates: [thunk-amd64.o]
+    cmds:
+      - clang -target x86_64-pc-windows-gnu -c thunk-amd64.S -o thunk-amd64.o
+
+  loader-compile-arm64:
+    desc: TinyGo-compile the disk-mode loader for arm64-UEFI.
+    deps: [loader-thunk-arm64]
+    dir: cmd/efi-loader
+    sources:
+      - main.go
+      - '../../{{.ARM64_TARGET}}'
+    generates: [main-arm64.o]
+    cmds:
+      - tinygo build -target=../../{{.ARM64_TARGET}} -o main-arm64.o .
+
+  loader-compile-amd64:
+    desc: TinyGo-compile the disk-mode loader for amd64-UEFI.
+    deps: [loader-thunk-amd64]
+    dir: cmd/efi-loader
+    sources:
+      - main.go
+      - '../../{{.AMD64_TARGET}}'
+    generates: [main-amd64.o]
+    cmds:
+      - tinygo build -target=../../{{.AMD64_TARGET}} -o main-amd64.o .
+
+  loader-arm64:
+    desc: 'Build the arm64 disk-mode loader → {{.LOADER_ARM64_OUT}}.'
+    deps: [loader-compile-arm64]
+    dir: cmd/efi-loader
+    cmds:
+      - >-
+        lld-link
+        /machine:arm64
+        /subsystem:efi_application
+        /entry:_start
+        /nodefaultlib
+        /force:unresolved
+        /base:0x10000
+        /out:{{.LOADER_ARM64_OUT}}
+        main-arm64.o thunk-arm64.o
+      - file {{.LOADER_ARM64_OUT}}
+
+  loader-amd64:
+    desc: 'Build the amd64 disk-mode loader → {{.LOADER_AMD64_OUT}}.'
+    deps: [loader-compile-amd64]
+    dir: cmd/efi-loader
+    cmds:
+      - >-
+        lld-link
+        /machine:x64
+        /subsystem:efi_application
+        /entry:_start
+        /nodefaultlib
+        /force:unresolved
+        /base:0x10000
+        /out:{{.LOADER_AMD64_OUT}}
+        main-amd64.o thunk-amd64.o
+      - file {{.LOADER_AMD64_OUT}}
+
+  loader:
+    desc: Build the disk-mode loader for both arches.
+    deps: [loader-arm64, loader-amd64]
+
+  # qemu-loader-arm64 builds a 64-MiB FAT32 ESP carrying the loader at
+  # /EFI/BOOT/BOOTAA64.EFI plus a chain-loadable EFI binary at
+  # /EFI/Linux/cloud-boot.efi — the canonical path the loader walks
+  # for. UKI_PATH defaults to the probe binary, which is small and
+  # produces a clear stdout trail. Override to chain a real UKI:
+  #
+  #   UKI_PATH=../../uki/out/uki-aa64.efi task qemu-loader-arm64
+  #
+  # The OVMF varstore is wiped on every run — OVMF caches a Boot0001
+  # entry across reboots that points at the *previous* ESP and will
+  # short-circuit the removable-media fallback unless reset.
+  qemu-loader-arm64:
+    desc: Boot the disk-mode loader under qemu-system-aarch64 / OVMF.
+    deps: [loader-arm64]
+    dir: cmd/efi-loader
+    vars:
+      UKI_PATH: '{{.UKI_PATH | default "../efi-probe/BOOTAA64-probe.EFI"}}'
+    cmds:
+      - rm -f esp.img ovmf_vars_arm64.fd
+      - dd if=/dev/zero of=ovmf_vars_arm64.fd bs=1M count=64 status=none
+      # FAT32 needs ≥ 32 MiB to stay above the cluster-count floor that
+      # OVMF's PartitionDxe requires; pick 64 MiB to leave headroom.
+      - dd if=/dev/zero of=esp.img bs=1M count=64 status=none
+      - "mformat -i esp.img -F ::"
+      - "mmd -i esp.img ::EFI ::EFI/BOOT ::EFI/Linux"
+      - "mcopy -i esp.img {{.LOADER_ARM64_OUT}} ::EFI/BOOT/BOOTAA64.EFI"
+      - >-
+        if [ -f "{{.UKI_PATH}}" ]; then
+          mcopy -i esp.img "{{.UKI_PATH}}" ::EFI/Linux/cloud-boot.efi;
+          echo "Staged UKI from {{.UKI_PATH}}";
+        else
+          echo "WARNING: {{.UKI_PATH}} not found — loader will report 'no UKI found'";
+        fi
+      - >-
+        qemu-system-aarch64
+        -machine virt,gic-version=max,accel=hvf:tcg -cpu max -m 1024 -smp 2
+        -drive if=pflash,format=raw,readonly=on,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd
+        -drive if=pflash,format=raw,file=ovmf_vars_arm64.fd
+        -drive if=virtio,format=raw,file=esp.img
+        -netdev user,id=n0 -device virtio-net-device,netdev=n0
+        -nographic -serial mon:stdio
+
   clean:
     cmds:
       - rm -f cmd/efi-probe/*.o cmd/efi-probe/*.EFI cmd/efi-probe/esp.img cmd/efi-probe/ovmf_vars_arm64.fd
+      - rm -f cmd/efi-loader/*.o cmd/efi-loader/*.EFI cmd/efi-loader/esp.img cmd/efi-loader/ovmf_vars_arm64.fd
+      - rm -rf cmd/efi-loader/esp-stage cmd/efi-loader/esp-loader.iso
