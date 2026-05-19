@@ -1927,6 +1927,99 @@ func parseBtrfsItem(b []byte, it *btrfsItem) bool {
 	return true
 }
 
+// ----- btrfs root tree walker -----
+//
+// The root tree (logical address = sb.root) is a B-tree whose
+// leaves carry ROOT_ITEM_KEY records (one per subvolume tree).
+// We look for objectid = BTRFS_FS_TREE_OBJECTID (5) to find the
+// default subvolume's tree root.
+//
+// btrfs_root_item layout (post-inode_item, total 160 + remaining):
+//
+//   0..160     btrfs_inode_item (we skip)
+//   160..168   generation
+//   168..176   root_dirid
+//   176..184   bytenr          ← logical addr of subvol tree root
+//   184..192   byte_limit
+//   192..200   bytes_used
+//   200..208   last_snapshot
+//   208..216   flags
+//   216..220   refs
+//   220..237   drop_progress (btrfs_disk_key)
+//   237        drop_level
+//   238        level           ← level of subvol tree root
+
+const (
+	btrfsRootItemKey       = 0x84 // BTRFS_ROOT_ITEM_KEY (132)
+	btrfsFsTreeObjectID    = 5    // BTRFS_FS_TREE_OBJECTID
+	btrfsRootItemBytenrOff = 176
+	btrfsRootItemLevelOff  = 238
+)
+
+// btrfsFsTreeRootLogical is the resolved logical address of the
+// FS_TREE root node, found by walkRootTreeForFSTree. btrfsFsTreeLevel
+// is its tree depth.
+var (
+	btrfsFsTreeRootLogical uint64
+	btrfsFsTreeLevel       uint8
+)
+
+func walkRootTreeForFSTree(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	rootLogical uint64, nodesize uint32,
+) bool {
+	rootPhys, ok := btrfsLogicalToPhys(rootLogical)
+	if !ok {
+		writeASCII(co, "    root_logical not covered by chunkMap\r\n")
+		return false
+	}
+	writeASCII(co, "    rootPhys=")
+	writeHex64(co, rootPhys)
+	writeASCII(co, "\r\n")
+	if !readBtrfsBlock(bio, mediaId, devBlkSz, rootPhys, nodesize,
+		unsafe.Pointer(&btrfsTreeBuf[0])) {
+		writeASCII(co, "    root-tree read failed\r\n")
+		return false
+	}
+	level := btrfsTreeBuf[100]
+	nritems := le32(btrfsTreeBuf[96:])
+	if level != 0 {
+		writeASCII(co, "    root-tree root is internal node (level=")
+		writeDec(co, uint64(level))
+		writeASCII(co, ") — multi-level walk not implemented yet\r\n")
+		return false
+	}
+	writeASCII(co, "    root-tree leaf: ")
+	writeDec(co, uint64(nritems))
+	writeASCII(co, " items, looking for FS_TREE (objectid=5)\r\n")
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
+		if off+btrfsItemSize > nodesize {
+			break
+		}
+		var it btrfsItem
+		if !parseBtrfsItem(btrfsTreeBuf[off:off+btrfsItemSize], &it) {
+			break
+		}
+		if it.objectid != btrfsFsTreeObjectID || it.keyType != btrfsRootItemKey {
+			continue
+		}
+		dataPos := uint32(btrfsHeaderSize) + it.dataOff
+		if dataPos+239 > nodesize {
+			break
+		}
+		btrfsFsTreeRootLogical = le64(btrfsTreeBuf[dataPos+btrfsRootItemBytenrOff:])
+		btrfsFsTreeLevel = btrfsTreeBuf[dataPos+btrfsRootItemLevelOff]
+		writeASCII(co, "    found FS_TREE: bytenr=")
+		writeHex64(co, btrfsFsTreeRootLogical)
+		writeASCII(co, " level=")
+		writeDec(co, uint64(btrfsFsTreeLevel))
+		writeASCII(co, "\r\n")
+		return true
+	}
+	writeASCII(co, "    FS_TREE not found in root tree\r\n")
+	return false
+}
+
 // walkChunkTreeLeaf reads the leaf at `phys` and appends every
 // CHUNK_ITEM_KEY (objectid=256, type=228) record to chunkMap.
 // Only handles the level-0 case (chunk_root_level=0) — sufficient
@@ -2063,6 +2156,10 @@ func probeBtrfsPartition(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz
 		writeHex64(co, c.physical)
 		writeASCII(co, "\r\n")
 	}
+
+	// Walk root tree → find FS_TREE.
+	walkRootTreeForFSTree(co, lastBIO, lastMediaId, lastDevBlkSz,
+		lastBtrfsSB.rootLogical, lastBtrfsSB.nodesize)
 }
 
 // ----- xfs inode -----
