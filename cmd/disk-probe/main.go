@@ -1927,6 +1927,180 @@ func parseBtrfsItem(b []byte, it *btrfsItem) bool {
 	return true
 }
 
+// ----- btrfs FS_TREE walker -----
+//
+// FS_TREE is the per-subvolume directory hierarchy. Its leaves
+// carry one or more record types per (objectid, name) pair:
+//
+//   INODE_ITEM_KEY  (0x01): inode metadata for `objectid`
+//   INODE_REF_KEY   (0x0C): reverse name lookup
+//   DIR_ITEM_KEY    (0x60): forward-lookup-by-hash entry
+//   DIR_INDEX_KEY   (0x61): sequential directory entries
+//   EXTENT_DATA_KEY (0x6C): file data extent (in regular files)
+//   XATTR_ITEM_KEY  (0x18): xattr
+//
+// Each DIR_ITEM_KEY or DIR_INDEX_KEY item's data is a
+// btrfs_dir_item record:
+//
+//   0..17    location (btrfs_disk_key — key of the target object)
+//   17..25   transid
+//   25..27   data_len  (xattr value length; 0 for plain dir entries)
+//   27..29   name_len
+//   29       type      (BTRFS_FT_*: 1=REG, 2=DIR, 7=SYMLINK …)
+//   30..     name[name_len]
+//   then     data[data_len] (xattr value or 0 bytes)
+//
+// The "location" field gives the child inode number / tree id; for
+// in-tree children that's (location.objectid, INODE_ITEM_KEY, 0).
+//
+// The root directory of an FS_TREE has objectid = 256
+// (BTRFS_FIRST_FREE_OBJECTID).
+
+const (
+	btrfsDirItemKey         = 0x60
+	btrfsDirIndexKey        = 0x61
+	btrfsInodeItemKey       = 0x01
+	btrfsExtentDataKey      = 0x6C
+	btrfsFirstFreeObjectID  = 256
+)
+
+// findInBtrfsDirPrefix walks the FS_TREE leaf for entries under
+// parentDirInode whose name starts with `prefix`. Returns the
+// matching child object id (file/dir inode number).
+//
+// Only handles level-0 FS_TREEs (single leaf node) for now —
+// follow-on commit adds B-tree descent for multi-node FS trees.
+func findInBtrfsDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	fsTreeLogical uint64, fsTreeLevel uint8, nodesize uint32,
+	parentDirInode uint64, prefix []byte,
+	outNameBuf *[255]byte, outNameLen *int,
+) (uint64, bool) {
+	if fsTreeLevel != 0 {
+		writeASCII(co, "    FS_TREE level>0 not yet supported\r\n")
+		return 0, false
+	}
+	phys, ok := btrfsLogicalToPhys(fsTreeLogical)
+	if !ok {
+		return 0, false
+	}
+	if !readBtrfsBlock(bio, mediaId, devBlkSz, phys, nodesize,
+		unsafe.Pointer(&btrfsTreeBuf[0])) {
+		return 0, false
+	}
+	nritems := le32(btrfsTreeBuf[96:])
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
+		if off+btrfsItemSize > nodesize {
+			break
+		}
+		var it btrfsItem
+		if !parseBtrfsItem(btrfsTreeBuf[off:off+btrfsItemSize], &it) {
+			break
+		}
+		if it.objectid != parentDirInode {
+			continue
+		}
+		if it.keyType != btrfsDirIndexKey {
+			continue
+		}
+		dataPos := uint32(btrfsHeaderSize) + it.dataOff
+		if dataPos+30 > nodesize {
+			break
+		}
+		// location is at dataPos+0; we want (objectid, type, offset)
+		locObjID := le64(btrfsTreeBuf[dataPos:])
+		// locType := btrfsTreeBuf[dataPos+8]
+		// locOff := le64(btrfsTreeBuf[dataPos+9:])
+		nameLen := le16(btrfsTreeBuf[dataPos+27:])
+		// ftype := btrfsTreeBuf[dataPos+29]
+		if uint32(nameLen) >= uint32(len(prefix)) &&
+			dataPos+30+uint32(nameLen) <= nodesize {
+			match := true
+			for j := 0; j < len(prefix); j++ {
+				if btrfsTreeBuf[dataPos+30+uint32(j)] != prefix[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				n := int(nameLen)
+				if n > len(outNameBuf) {
+					n = len(outNameBuf)
+				}
+				for j := 0; j < n; j++ {
+					outNameBuf[j] = btrfsTreeBuf[dataPos+30+uint32(j)]
+				}
+				*outNameLen = n
+				return locObjID, true
+			}
+		}
+	}
+	_ = co
+	return 0, false
+}
+
+// listBtrfsDir dumps every DIR_INDEX_KEY entry under `parentDirInode`
+// in the FS_TREE leaf. Diagnostic only — used to figure out what's
+// actually present at a given inode level (snapshot subvolume names,
+// "@", etc. on distributions that don't put the user-visible root
+// directly under inode 256).
+func listBtrfsDir(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	fsTreeLogical uint64, fsTreeLevel uint8, nodesize uint32,
+	parentDirInode uint64,
+) {
+	if fsTreeLevel != 0 {
+		return
+	}
+	phys, ok := btrfsLogicalToPhys(fsTreeLogical)
+	if !ok {
+		return
+	}
+	if !readBtrfsBlock(bio, mediaId, devBlkSz, phys, nodesize,
+		unsafe.Pointer(&btrfsTreeBuf[0])) {
+		return
+	}
+	nritems := le32(btrfsTreeBuf[96:])
+	writeASCII(co, "    contents of inode ")
+	writeDec(co, parentDirInode)
+	writeASCII(co, ":\r\n")
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
+		if off+btrfsItemSize > nodesize {
+			break
+		}
+		var it btrfsItem
+		if !parseBtrfsItem(btrfsTreeBuf[off:off+btrfsItemSize], &it) {
+			break
+		}
+		if it.objectid != parentDirInode || it.keyType != btrfsDirIndexKey {
+			continue
+		}
+		dataPos := uint32(btrfsHeaderSize) + it.dataOff
+		if dataPos+30 > nodesize {
+			break
+		}
+		locObjID := le64(btrfsTreeBuf[dataPos:])
+		locType := btrfsTreeBuf[dataPos+8]
+		nameLen := le16(btrfsTreeBuf[dataPos+27:])
+		ftype := btrfsTreeBuf[dataPos+29]
+		if dataPos+30+uint32(nameLen) > nodesize {
+			break
+		}
+		writeASCII(co, "      [child=")
+		writeDec(co, locObjID)
+		writeASCII(co, "/loc.type=")
+		writeHex64(co, uint64(locType))
+		writeASCII(co, "/ft=")
+		writeDec(co, uint64(ftype))
+		writeASCII(co, "] ")
+		for j := uint16(0); j < nameLen; j++ {
+			oneCharBuf[0] = btrfsTreeBuf[dataPos+30+uint32(j)]
+			writeASCII(co, oneCharStr)
+		}
+		writeASCII(co, "\r\n")
+	}
+}
+
 // ----- btrfs root tree walker -----
 //
 // The root tree (logical address = sb.root) is a B-tree whose
@@ -2158,9 +2332,54 @@ func probeBtrfsPartition(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz
 	}
 
 	// Walk root tree → find FS_TREE.
-	walkRootTreeForFSTree(co, lastBIO, lastMediaId, lastDevBlkSz,
-		lastBtrfsSB.rootLogical, lastBtrfsSB.nodesize)
+	if !walkRootTreeForFSTree(co, lastBIO, lastMediaId, lastDevBlkSz,
+		lastBtrfsSB.rootLogical, lastBtrfsSB.nodesize) {
+		return
+	}
+	// Dump what's under FS_TREE root (inode 256) for diagnostic —
+	// MicroOS uses snapshot subvolumes so "/" isn't where we
+	// initially expect.
+	listBtrfsDir(co, lastBIO, lastMediaId, lastDevBlkSz,
+		btrfsFsTreeRootLogical, btrfsFsTreeLevel, lastBtrfsSB.nodesize,
+		btrfsFirstFreeObjectID)
+
+	// FS_TREE → find /boot under root inode 256.
+	bootInode, ok2 := findInBtrfsDirPrefix(co, lastBIO, lastMediaId, lastDevBlkSz,
+		btrfsFsTreeRootLogical, btrfsFsTreeLevel, lastBtrfsSB.nodesize,
+		btrfsFirstFreeObjectID, btrfsBootName[:],
+		&btrfsScanName, &btrfsScanNameLen)
+	if !ok2 {
+		writeASCII(co, "    /boot not found under FS_TREE root\r\n")
+		return
+	}
+	writeASCII(co, "    /boot inode = ")
+	writeDec(co, bootInode)
+	writeASCII(co, "\r\n")
+	// /boot → find vmlinuz-* under it.
+	kIno, ok3 := findInBtrfsDirPrefix(co, lastBIO, lastMediaId, lastDevBlkSz,
+		btrfsFsTreeRootLogical, btrfsFsTreeLevel, lastBtrfsSB.nodesize,
+		bootInode, vmlinuzPrefix[:],
+		&btrfsScanName, &btrfsScanNameLen)
+	if !ok3 {
+		writeASCII(co, "    no vmlinuz-* under /boot\r\n")
+		return
+	}
+	writeASCII(co, "    kernel: ")
+	for i := 0; i < btrfsScanNameLen; i++ {
+		oneCharBuf[0] = btrfsScanName[i]
+		writeASCII(co, oneCharStr)
+	}
+	writeASCII(co, " (inode=")
+	writeDec(co, kIno)
+	writeASCII(co, ")\r\n")
 }
+
+// Hardcoded prefix buffers for the btrfs dir search.
+var (
+	btrfsBootName    = [...]byte{'b', 'o', 'o', 't'}
+	btrfsScanName    [255]byte
+	btrfsScanNameLen int
+)
 
 // ----- xfs inode -----
 //
