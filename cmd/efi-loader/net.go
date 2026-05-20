@@ -144,11 +144,32 @@ func netInit(co *efiSimpleTextOutput, bs *efiBootServices) bool {
 		uintptr(unsafe.Pointer(&netSNPHandleCount)),
 		uintptr(unsafe.Pointer(&netSNPHandleBuf)))
 	if st != efiSuccess || netSNPHandleCount == 0 {
-		writeASCII(co, "  no SimpleNetwork handles (status=")
-		writeHex64(co, st)
-		writeASCII(co, ")\r\n")
-		bootMark("NET-NONIC")
-		return false
+		// vfkit / Apple-EFI usually returns 0 SNP handles here even
+		// though the firmware ships the SNP driver — it just hasn't
+		// been bound to the virtio-net device yet. Force a recursive
+		// ConnectController on every handle in the system; the driver
+		// binding cascade attaches SNP onto PCI NICs that match its
+		// supported predicate. Then retry.
+		writeASCII(co, "  no SNP handles yet — forcing ConnectController\r\n")
+		netConnectAllHandles(co, bs)
+		netSNPHandleCount = 0
+		netSNPHandleBuf = 0
+		st = efiCall5(bs.locateHandleBuffer,
+			uintptr(2),
+			uintptr(unsafe.Pointer(&simpleNetworkGUID)),
+			0,
+			uintptr(unsafe.Pointer(&netSNPHandleCount)),
+			uintptr(unsafe.Pointer(&netSNPHandleBuf)))
+		if st != efiSuccess || netSNPHandleCount == 0 {
+			writeASCII(co, "  still no SimpleNetwork handles (status=")
+			writeHex64(co, st)
+			writeASCII(co, ")\r\n")
+			bootMark("NET-NONIC")
+			return false
+		}
+		writeASCII(co, "  after ConnectController: ")
+		writeHex64(co, uint64(netSNPHandleCount))
+		writeASCII(co, " handle(s)\r\n")
 	}
 	writeASCII(co, "  ")
 	writeHex64(co, uint64(netSNPHandleCount))
@@ -219,6 +240,66 @@ func netInit(co *efiSimpleTextOutput, bs *efiBootServices) bool {
 	writeASCII(co, "  no usable SimpleNetwork handle\r\n")
 	bootMark("NET-FAIL")
 	return false
+}
+
+// netConnectAllHandles enumerates every handle in the system and
+// runs ConnectController(recursive=TRUE) on each. Equivalent to what
+// `connect -r` does in the UEFI shell: it tells the firmware to walk
+// its driver binding database and attach every supported driver to
+// every device handle it can. The standard UEFI boot manager does
+// this implicitly before loading a boot option; an EFI app loaded
+// directly from the FAT removable-media path (our case) usually has
+// to trigger it explicitly.
+//
+// `bs.locateHandle` with SearchType=0 (AllHandles) and ProtocolGUID
+// = NULL returns every handle. Buffer is sized via a two-call dance:
+// first call returns EFI_BUFFER_TOO_SMALL with the required size in
+// `bufSize`, second call fills the buffer.
+//
+// Package-scope state — TinyGo+UEFI escape rules.
+var (
+	netAllHandlesBufSize uintptr
+	netAllHandlesBuf     [128]uintptr
+)
+
+const efiBufferTooSmallNet efiStatus = 0x8000000000000005
+
+func netConnectAllHandles(co *efiSimpleTextOutput, bs *efiBootServices) {
+	// First sizing call: SearchType=0 (AllHandles), Protocol=NULL,
+	// SearchKey=NULL. EFI_BUFFER_TOO_SMALL is the expected return.
+	netAllHandlesBufSize = uintptr(len(netAllHandlesBuf)) * unsafe.Sizeof(uintptr(0))
+	st := efiCall5(bs.locateHandle,
+		uintptr(0), // AllHandles
+		0,
+		0,
+		uintptr(unsafe.Pointer(&netAllHandlesBufSize)),
+		uintptr(unsafe.Pointer(&netAllHandlesBuf[0])))
+	if st == efiBufferTooSmallNet {
+		// We capped at 128 handles — anything beyond that is firmware
+		// of unusual size. Just use what fits.
+		netAllHandlesBufSize = uintptr(len(netAllHandlesBuf)) * unsafe.Sizeof(uintptr(0))
+		st = efiSuccess
+	}
+	if st != efiSuccess {
+		writeASCII(co, "    locateHandle(All) failed: ")
+		writeHex64(co, st)
+		writeASCII(co, "\r\n")
+		return
+	}
+	count := netAllHandlesBufSize / unsafe.Sizeof(uintptr(0))
+	writeASCII(co, "    enumerated ")
+	writeHex64(co, uint64(count))
+	writeASCII(co, " handle(s); ConnectController on each\r\n")
+	for i := uintptr(0); i < count; i++ {
+		efiCall4(bs.connectController,
+			netAllHandlesBuf[i],
+			0, // DriverImageHandle = NULL → try all drivers
+			0, // RemainingDevicePath = NULL
+			1) // Recursive = TRUE
+	}
+	// Brief stall so any newly-bound NIC driver finishes its
+	// initialization (some virtio paths do RX-ring setup async).
+	efiCall2(bs.stall, 200_000, 0)
 }
 
 // writeHexMAC prints a 6-byte MAC as `xx:xx:xx:xx:xx:xx`. Not pretty,
