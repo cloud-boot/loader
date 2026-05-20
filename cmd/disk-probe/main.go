@@ -2186,6 +2186,139 @@ const (
 // Zero means "no override, use FS_TREE objectid=5".
 var btrfsActiveSubvolRootID uint64
 
+// btrfsKernelSubvolRootID is set by scanSubvolumesForKernel to the
+// objectid of the first subvolume whose FS tree carries
+// /boot/vmlinuz-* or /vmlinuz-* at root. btrfsKernelDirInode points
+// at the directory inode that holds the kernel (256 if at subvol
+// root, otherwise the inode of "boot" inside it).
+var (
+	btrfsKernelSubvolRootID uint64
+	btrfsKernelDirInode     uint64
+	btrfsKernelBytenr       uint64
+	btrfsKernelLevel        uint8
+
+	// Candidate (rootID, bytenr, level) tuples for the subvol scan.
+	// Package-scope to keep their addresses out of TinyGo's escape
+	// analyser. 32 is enough for typical cloud images.
+	candIDs     [32]uint64
+	candBytenrs [32]uint64
+	candLevels  [32]uint8
+)
+
+// scanSubvolumesForKernel walks every ROOT_ITEM_KEY in the root tree
+// whose objectid is >= 256 (user subvolume IDs) and tries to find
+// /boot/vmlinuz-* (Debian-style) or /vmlinuz-* (separate-/boot-style)
+// at that subvolume's root. First hit wins.
+//
+// Brute-force but bounded — typical cloud images have under ~20
+// subvolumes, and each one only triggers two leaf reads (subvol
+// tree's root node + one extent of the matching dir). On openSUSE
+// MicroOS this is the price of admission for skipping the
+// systemd-boot / GRUB BLS-config parse that would otherwise be
+// required to learn which snapshot is active.
+//
+// Returns true on success and populates btrfsKernel{SubvolRootID,
+// Bytenr, Level, DirInode}.
+func scanSubvolumesForKernel(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
+	rootLogical uint64, nodesize uint32,
+) bool {
+	rootPhys, ok := btrfsLogicalToPhys(rootLogical)
+	if !ok {
+		return false
+	}
+	if !readBtrfsBlock(bio, mediaId, devBlkSz, rootPhys, nodesize,
+		unsafe.Pointer(&btrfsTreeBuf[0])) {
+		return false
+	}
+	if btrfsTreeBuf[100] != 0 {
+		return false
+	}
+	nritems := le32(btrfsTreeBuf[96:])
+	// Candidate arrays MUST be package-scope. TinyGo escape
+	// analysis promotes any stack-local whose address is taken
+	// (here implicitly by passing through the inner loop) to a
+	// heap alloc → VirtualAlloc → trap.
+	candCount := 0
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
+		if off+btrfsItemSize > nodesize {
+			break
+		}
+		var it btrfsItem
+		if !parseBtrfsItem(btrfsTreeBuf[off:off+btrfsItemSize], &it) {
+			break
+		}
+		// User subvolumes only.
+		if it.keyType != btrfsRootItemKey || it.objectid < 256 {
+			continue
+		}
+		dataPos := uint32(btrfsHeaderSize) + it.dataOff
+		if dataPos+239 > nodesize {
+			break
+		}
+		bytenr := le64(btrfsTreeBuf[dataPos+btrfsRootItemBytenrOff:])
+		level := btrfsTreeBuf[dataPos+btrfsRootItemLevelOff]
+		if candCount >= len(candIDs) {
+			break
+		}
+		candIDs[candCount] = it.objectid
+		candBytenrs[candCount] = bytenr
+		candLevels[candCount] = level
+		candCount++
+	}
+	writeASCII(co, "    subvol scan: ")
+	writeDec(co, uint64(candCount))
+	writeASCII(co, " candidates\r\n")
+
+	for k := 0; k < candCount; k++ {
+		// Try /vmlinuz-* at the subvolume's root first (RHEL-style
+		// "/boot is the subvolume root").
+		kIno, ok := findInBtrfsDirPrefix(co, bio, mediaId, devBlkSz,
+			candBytenrs[k], candLevels[k], nodesize,
+			btrfsFirstFreeObjectID, vmlinuzPrefix[:],
+			&btrfsScanName, &btrfsScanNameLen)
+		if ok {
+			writeASCII(co, "      subvol ")
+			writeDec(co, candIDs[k])
+			writeASCII(co, " has /vmlinuz-* (ino=")
+			writeDec(co, kIno)
+			writeASCII(co, ")\r\n")
+			btrfsKernelSubvolRootID = candIDs[k]
+			btrfsKernelBytenr = candBytenrs[k]
+			btrfsKernelLevel = candLevels[k]
+			btrfsKernelDirInode = btrfsFirstFreeObjectID
+			return true
+		}
+		// Fall back to /boot/vmlinuz-*. findInBtrfsDirPrefix matches
+		// names that *start with* prefix — "boot" works as a prefix
+		// of "boot" itself (the dir entry being looked for here).
+		bIno, hasBoot := findInBtrfsDirPrefix(co, bio, mediaId, devBlkSz,
+			candBytenrs[k], candLevels[k], nodesize,
+			btrfsFirstFreeObjectID, btrfsBootName[:],
+			&btrfsScanName, &btrfsScanNameLen)
+		if hasBoot && bIno != 0 {
+			kIno2, ok2 := findInBtrfsDirPrefix(co, bio, mediaId, devBlkSz,
+				candBytenrs[k], candLevels[k], nodesize,
+				bIno, vmlinuzPrefix[:],
+				&btrfsScanName, &btrfsScanNameLen)
+			if ok2 {
+				writeASCII(co, "      subvol ")
+				writeDec(co, candIDs[k])
+				writeASCII(co, " has /boot/vmlinuz-* (ino=")
+				writeDec(co, kIno2)
+				writeASCII(co, ")\r\n")
+				btrfsKernelSubvolRootID = candIDs[k]
+				btrfsKernelBytenr = candBytenrs[k]
+				btrfsKernelLevel = candLevels[k]
+				btrfsKernelDirInode = bIno
+				return true
+			}
+		}
+	}
+	writeASCII(co, "    no subvolume carries vmlinuz-*\r\n")
+	return false
+}
+
 // walkRootTreeForDefaultSubvol scans the root-tree leaf for a
 // DIR_ITEM_KEY entry under ROOT_TREE_DIR_OBJECTID (6) whose name is
 // "default" and pulls out the subvolume's root_id from the
@@ -2543,6 +2676,25 @@ func probeBtrfsPartition(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz
 	// ROOT_ITEM_KEYs).
 	dumpBtrfsLeafAll(co, lastBIO, lastMediaId, lastDevBlkSz,
 		lastBtrfsSB.rootLogical, lastBtrfsSB.nodesize, "root tree items")
+
+	// First try the all-subvolumes scan — works for snapshot-heavy
+	// distros (openSUSE MicroOS) where the FS_TREE root is empty
+	// and the kernel lives in some other subvolume.
+	if scanSubvolumesForKernel(co, lastBIO, lastMediaId, lastDevBlkSz,
+		lastBtrfsSB.rootLogical, lastBtrfsSB.nodesize) {
+		writeASCII(co, "    btrfs kernel found via subvol scan: subvol=")
+		writeDec(co, btrfsKernelSubvolRootID)
+		writeASCII(co, " bytenr=")
+		writeHex64(co, btrfsKernelBytenr)
+		writeASCII(co, " dirInode=")
+		writeDec(co, btrfsKernelDirInode)
+		writeASCII(co, " name=")
+		for i := 0; i < btrfsScanNameLen; i++ {
+			oneCharBuf[0] = btrfsScanName[i]
+			writeASCII(co, oneCharStr)
+		}
+		writeASCII(co, "\r\n")
+	}
 
 	// FS_TREE → find /boot under root inode 256.
 	bootInode, ok2 := findInBtrfsDirPrefix(co, lastBIO, lastMediaId, lastDevBlkSz,
