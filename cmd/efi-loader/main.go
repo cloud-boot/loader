@@ -258,6 +258,17 @@ var bootMarkVarName = [...]uint16{
 }
 var bootMarkVarData = [...]byte{'C', 'B', '-', 'R', 'A', 'N'}
 
+// "CloudBootMAC" — set by the net-init shortcut after netInit
+// succeeds; holds the 6-byte MAC address the firmware reports for
+// the active SimpleNetwork interface. Phase-A proof that the loader
+// can talk to a NIC at all; subsequent phases (ARP/IP/TCP) build on
+// the same instance.
+var netMacVarName = [...]uint16{
+	'C', 'l', 'o', 'u', 'd', 'B', 'o', 'o', 't', 'M', 'A', 'C',
+	0,
+}
+var netMarkVarData [6]byte
+
 // bootMarkRT is the package-scope runtime services pointer + marker
 // helper so any cascade point can update CloudBootMark without
 // threading rt + co through every function. Set once in _start.
@@ -965,6 +976,33 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	// that the loader executed at all.
 	bootMarkRT = rt
 	bootMark("CB-RAN")
+
+	// Phase-A passive probe: bring the EFI_SIMPLE_NETWORK interface
+	// up (LocateHandleBuffer → HandleProtocol → Start → Initialize
+	// → ReceiveFilters) and stash the active MAC in the non-volatile
+	// `CloudBootMAC` EFI variable. Non-fatal — if no NIC handle is
+	// exposed (e.g. firmware without an SNP driver for the connected
+	// device), we just continue with the existing FAT-UKI / cloud-disk
+	// cascade. CloudBootMAC absent from the post-run varstore = SNP
+	// not reachable.
+	//
+	// This is the foundation the loader's eventual OCI plan fetch
+	// sits on (see memory:loader-network-stack-roadmap). Keeping it
+	// non-fatal lets the loader continue to boot the existing 6
+	// distros without depending on network — the OCI path is opt-in.
+	if netInit(co, bs) {
+		for i := 0; i < 6; i++ {
+			netMarkVarData[i] = netLocalMAC[i]
+		}
+		if rt != nil && rt.setVariable != 0 {
+			efiCall5(rt.setVariable,
+				uintptr(unsafe.Pointer(&netMacVarName[0])),
+				uintptr(unsafe.Pointer(&cloudBootGUID)),
+				uintptr(0x07), // NV|BS|RT
+				uintptr(len(netMarkVarData)),
+				uintptr(unsafe.Pointer(&netMarkVarData[0])))
+		}
+	}
 
 	writeASCII(co, "cloud-boot/loader — phase 5b/5c/5d\r\n")
 
