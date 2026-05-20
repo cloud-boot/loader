@@ -1,10 +1,32 @@
 # cloud-boot/loader
 
-**Phase-0 / experimental.** Pure-UEFI variant of cloud-boot — a TinyGo
-PE/COFF stub that does the plan-fetch + kernel-handoff entirely inside
-UEFI Boot Services, with NO Linux bootstrap kernel in between. The
-existing `init/` + `uki/` pipeline (Linux kernel + kexec) is unchanged;
-this lives in parallel.
+Pure-UEFI variant of cloud-boot — a TinyGo PE/COFF UEFI application
+that finds the distro kernel at runtime and hands off via
+`BootServices.LoadImage` + `StartImage`, with NO Linux bootstrap
+kernel in between. The existing `init/` + `uki/` pipeline (bootstrap
+kernel + kexec) is unchanged; this lives in parallel.
+
+A single `BOOTAA64.EFI` binary boots every major Linux distro family
+end-to-end from an unmodified cloud disk image (arm64; amd64 builds
+clean and ought to behave the same, untested in this round):
+
+| Family | Filesystem layout | Status |
+| --- | --- | --- |
+| Debian Trixie | ext4 rootfs (/boot inside) | ✓ login prompt |
+| Ubuntu Noble 24.04 | ext4 rootfs + gzip-compressed vmlinuz | ✓ systemd 255.4 running |
+| Fedora 41 | ext4 /boot + btrfs / | ✓ Basic System |
+| AlmaLinux 9 / RHEL family | xfs /boot + xfs / | ✓ systemd target |
+| openSUSE Leap Micro 6.2 | btrfs (default-subvol snapshot) | ✓ JeOS Firstboot |
+
+Each filesystem driver (ext4, xfs, btrfs) sits in its own file under
+`cmd/efi-loader/`; the cascade in [`main.go`](cmd/efi-loader/main.go)
+tries them in order after the FAT-volume UKI lookup misses. Inside
+the btrfs path we follow the default-subvol indirection, walk
+arbitrary-depth B-trees with key-range pruning, and resolve relative
+symlinks (`/boot/Image-* → /usr/lib/modules/<ver>/<file>` on openSUSE).
+A `CloudBootTarget=<fs>-direct` EFI var (`ext4-direct`, `xfs-direct`,
+`btrfs-direct`) skips the earlier rungs when the host knows the
+layout.
 
 ## Why
 
@@ -34,6 +56,9 @@ non-Linux EFI image works the same way.
 | 5b | Cmdline propagation: EFI variable (`CloudBootCmdline`) primary, `\cmdline` file fallback; `loaded-image->load_options` patched on the child | done — see [Phase 5b result](#phase-5b-result) |
 | 5c | Multiple candidate UKIs, fallback order, `CloudBootTarget` selector | done |
 | 5d | Boot the kernel inside an *unmodified* Linux cloud distribution image: walk BlockIO, read ext4 directly, locate `/boot/vmlinuz-*` + `/boot/initrd.img-*`, `EFI_LOAD_FILE2_PROTOCOL` for initrd, `LoadImage` + `StartImage` | done — see [Phase 5d result](#phase-5d-result) |
+| 5e | xfs cloud-disk path: same handoff but reads RHEL-family layouts (xfs /boot + xfs /). Short-form + block-form directories, bit-packed `xfs_bmbt_rec` extents, v5 inode core. AlmaLinux 9. | done |
+| 5f | btrfs cloud-disk path: sys_chunk_array bootstrap + chunk-tree extension; default-subvol indirection; depth-N B-tree walker with key-range pruning; INODE_ITEM mode dispatch; inline-extent symlink resolution. openSUSE Leap Micro 6.2. | done |
+| 5g | Ubuntu Noble: same ext4 walker, but the cloud kernel is gzip-wrapped (`1F 8B 08 ...`). In-loader RFC 1951/1952 DEFLATE/gzip inflate into a fresh AllocatePool buffer before LoadImage. | done |
 
 ## Phase 0 result
 
@@ -309,26 +334,36 @@ that's what every distro installer needs.
 
 ### Code layout
 
-The ext4 driver lives in
-[`cmd/efi-loader/ext4.go`](cmd/efi-loader/ext4.go) (~700 lines).
-It carries:
+Each filesystem driver is one file under
+[`cmd/efi-loader/`](cmd/efi-loader/), pulling in the shared
+`EFI_BLOCK_IO_PROTOCOL` / `EFI_LOAD_FILE2_PROTOCOL` /
+`installInitrdProtocol` / `LoadImage` plumbing from
+[`main.go`](cmd/efi-loader/main.go) and
+[`ext4.go`](cmd/efi-loader/ext4.go).
 
-- `efiBlockIO` / `efiBlockIOMedia` + `EFI_BLOCK_IO_PROTOCOL_GUID`.
-- ext4 superblock + group descriptor + auth-and-non-auth inode
-  parsers.
-- `readDataBlock` (depth-0 extents) and `readFile` (depth-0 + 1) —
-  enough for any single file under ~5 GiB on 4 KiB blocks.
-- `findInDir` / `findInDirPrefix` walking ext4_dir_entry_2
-  records.
-- `EFI_LOAD_FILE2_PROTOCOL` instance + `goLoadFile2` callback +
-  `installInitrdProtocol`.
-- `tryCloudDiskBoot` orchestrator that `_start` calls when the
-  FAT-volume UKI search returns nothing.
+- [`ext4.go`](cmd/efi-loader/ext4.go) — superblock, group descriptor,
+  inode (depth-0 + depth-1 extent trees), `findInDirPrefix` over
+  `ext4_dir_entry_2` records, `tryCloudDiskBoot` orchestrator.
+- [`xfs.go`](cmd/efi-loader/xfs.go) — big-endian SB, v5 176-byte
+  inode core, bit-packed `xfs_bmbt_rec` extents, short-form and
+  block-form directory walkers, `tryXfsCloudBoot`.
+- [`btrfs.go`](cmd/efi-loader/btrfs.go) — sys_chunk_array bootstrap,
+  chunk-tree extension, default-subvol indirection, depth-N B-tree
+  walker with key-range pruning, INODE_ITEM (size + mode),
+  EXTENT_DATA reader (inline + regular), inline-extent symlink
+  resolution, `tryBtrfsCloudBoot`.
+- [`inflate.go`](cmd/efi-loader/inflate.go) — RFC 1951/1952
+  gzip/DEFLATE inflate (fixed + dynamic Huffman, sliding-window
+  folded into output buffer). Triggered by `isGzipped(kernelBufPtr)`
+  on the freshly-read kernel — Ubuntu Noble arm64 needs this.
 
-The Phase-5d scaffolding lives in `cmd/disk-probe/` — same code
-path, but as a standalone diagnostic binary with verbose output
-for each step (see its commit history for the step-by-step
-bring-up against the Debian image).
+The exploratory scaffolding lives in
+[`cmd/disk-probe/`](cmd/disk-probe/) — same algorithms as the
+production drivers but with verbose `writeASCII` diagnostics at
+every step. Useful when adding a new filesystem or distro: bring it
+up under disk-probe first to see exactly which step fails, then
+port the algorithm into the corresponding `cmd/efi-loader/*.go`
+once it works.
 
 ## Reproduce
 
