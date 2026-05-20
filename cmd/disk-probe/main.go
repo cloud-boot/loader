@@ -755,6 +755,14 @@ var bootNameBuf = [...]byte{'b', 'o', 'o', 't'}
 // avoids matching shadow files like "vmlinuz.old" or "vmlinuz.tmp".
 var vmlinuzPrefix = [...]byte{'v', 'm', 'l', 'i', 'n', 'u', 'z', '-'}
 
+// imagePrefix is the arm64-distro convention some images use instead
+// of "vmlinuz-" — openSUSE Leap Micro / MicroOS arm64 ships
+// `/boot/Image-<ver>-default` as the kernel file (with a `vmlinuz`
+// symlink that btrfs stores as a separate inode without the prefix
+// scanner finding it). The "-" terminator likewise avoids matching
+// random "Image" siblings.
+var imagePrefix = [...]byte{'I', 'm', 'a', 'g', 'e', '-'}
+
 // kernelName is filled by findInDirPrefix when a vmlinuz-* match is
 // found; the full filename is read out so the rest of the loader can
 // reference / log it. 255 = max ext4 dir_entry name length.
@@ -1957,100 +1965,123 @@ func parseBtrfsItem(b []byte, it *btrfsItem) bool {
 // (BTRFS_FIRST_FREE_OBJECTID).
 
 const (
-	btrfsDirItemKey         = 0x60
-	btrfsDirIndexKey        = 0x61
+	// Canonical btrfs key type numbers (linux/fs/btrfs/ctree.h):
+	//   BTRFS_DIR_ITEM_KEY  = 84  (0x54)
+	//   BTRFS_DIR_INDEX_KEY = 96  (0x60)
+	// Earlier revisions used 0x60/0x61 — those values are for
+	// DIR_LOG_ITEM / DIR_LOG_INDEX (60/72), not the on-disk dir
+	// entries we need to walk.
+	btrfsDirItemKey         = 0x54
+	btrfsDirIndexKey        = 0x60
 	btrfsInodeItemKey       = 0x01
 	btrfsExtentDataKey      = 0x6C
 	btrfsFirstFreeObjectID  = 256
 )
 
-// findInBtrfsDirPrefix walks the FS_TREE leaf for entries under
-// parentDirInode whose name starts with `prefix`. Returns the
-// matching child object id (file/dir inode number).
+// findInBtrfsDirPrefix walks an FS_TREE of arbitrary depth for the
+// first DIR_INDEX or DIR_ITEM entry under parentDirInode whose name
+// starts with `prefix`. Returns the matching child object id
+// (file/dir inode number, or — for cross-tree references like a
+// snapshot subvolume — a different root_id).
 //
-// Handles level-0 (single leaf node) AND level-1 (internal node
-// pointing to leaf blocks) FS trees. Depth ≥ 2 is uncommon on
-// cloud images at the per-directory level and is rejected (callers
-// move on to the next subvol candidate).
+// Iterative DFS with key-range pruning: at each internal node we only
+// descend into children whose first-key/last-key range overlaps
+// (parentDirInode, *, *). A subvol with millions of total leaves
+// typically requires only 2-3 node reads to reach the leaf holding
+// the target dir entries.
 //
 // Internal nodes carry btrfs_key_ptr entries — 33 bytes each:
 //
-//	0..17   btrfs_disk_key (objectid, type, offset)
+//	0..17   btrfs_disk_key (objectid u64 LE, type u8, offset u64 LE)
 //	17..25  blockptr        (logical addr of child node)
 //	25..33  generation
 //
-// We collect every child's blockptr first (so the subsequent
-// per-child ReadBlocks call can safely re-use btrfsTreeBuf), then
-// load each child as a leaf and scan it.
+// Worklist is stored in package-scope arrays — TinyGo escape
+// analysis would otherwise heap-promote a stack-local equivalent.
 
-// childBlockPtrs is the package-scope scratch for the child block
-// pointers collected from a level-1 internal node. Cap is plenty
-// for cloud-image trees (typical fanout is hundreds, but the
-// directories we walk for /boot lookup only need a handful of
-// leaves at most).
 var (
-	childBlockPtrs [256]uint64
-	childPtrCount  int
+	// LIFO worklist for the iterative B-tree walk. Cap is generous
+	// — even a level-4 fanout-256 tree won't put more than 256
+	// entries on the worklist at once when we prune correctly.
+	btrfsWalkBytenr [512]uint64
+	btrfsWalkLevel  [512]uint8
+	btrfsWalkCount  int
 )
+
+const btrfsWalkMaxSteps = 4096
 
 func findInBtrfsDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
 	fsTreeLogical uint64, fsTreeLevel uint8, nodesize uint32,
 	parentDirInode uint64, prefix []byte,
 	outNameBuf *[255]byte, outNameLen *int,
 ) (uint64, bool) {
-	if fsTreeLevel > 1 {
-		// Multi-level descent (level ≥ 2) not implemented — would
-		// need iterative DFS with per-depth scratch buffers.
-		return 0, false
-	}
-	phys, ok := btrfsLogicalToPhys(fsTreeLogical)
-	if !ok {
-		return 0, false
-	}
-	if !readBtrfsBlock(bio, mediaId, devBlkSz, phys, nodesize,
-		unsafe.Pointer(&btrfsTreeBuf[0])) {
-		return 0, false
-	}
-	actualLevel := btrfsTreeBuf[100]
-
-	if actualLevel == 0 {
-		return scanBtrfsLeafForDirPrefix(parentDirInode, prefix,
-			outNameBuf, outNameLen, nodesize)
-	}
-
-	// level == 1 — internal node. Collect every child bytenr first
-	// so the leaf reads below can safely re-use btrfsTreeBuf.
-	nritems := le32(btrfsTreeBuf[96:])
-	childPtrCount = 0
-	for i := uint32(0); i < nritems; i++ {
-		off := uint32(btrfsHeaderSize) + i*btrfsKeyPtrSize
-		if off+btrfsKeyPtrSize > nodesize {
-			break
-		}
-		if childPtrCount >= len(childBlockPtrs) {
-			break
-		}
-		childBlockPtrs[childPtrCount] = le64(btrfsTreeBuf[off+17:])
-		childPtrCount++
-	}
-	// Walk each child leaf, first match wins.
-	for j := 0; j < childPtrCount; j++ {
-		cphys, ok := btrfsLogicalToPhys(childBlockPtrs[j])
+	btrfsWalkCount = 0
+	btrfsWalkBytenr[0] = fsTreeLogical
+	btrfsWalkLevel[0] = fsTreeLevel
+	btrfsWalkCount = 1
+	steps := 0
+	for btrfsWalkCount > 0 && steps < btrfsWalkMaxSteps {
+		steps++
+		btrfsWalkCount--
+		cur := btrfsWalkBytenr[btrfsWalkCount]
+		lvl := btrfsWalkLevel[btrfsWalkCount]
+		phys, ok := btrfsLogicalToPhys(cur)
 		if !ok {
 			continue
 		}
-		if !readBtrfsBlock(bio, mediaId, devBlkSz, cphys, nodesize,
+		if !readBtrfsBlock(bio, mediaId, devBlkSz, phys, nodesize,
 			unsafe.Pointer(&btrfsTreeBuf[0])) {
 			continue
 		}
-		if btrfsTreeBuf[100] != 0 {
-			// Child is itself an internal node — depth ≥ 2.
+		// Header is permissive on level mismatch — some trees lie or
+		// the caller might've passed level=0 for a freshly-read root.
+		// Trust the on-disk header byte instead.
+		actualLevel := btrfsTreeBuf[100]
+		_ = lvl
+		if actualLevel == 0 {
+			ino, found := scanBtrfsLeafForDirPrefix(parentDirInode, prefix,
+				outNameBuf, outNameLen, nodesize)
+			if found {
+				return ino, true
+			}
 			continue
 		}
-		ino, found := scanBtrfsLeafForDirPrefix(parentDirInode, prefix,
-			outNameBuf, outNameLen, nodesize)
-		if found {
-			return ino, true
+		// Internal node — push relevant children. Walk left-to-right
+		// but break early once we pass the target objectid (children
+		// are sorted by first-key).
+		nritems := le32(btrfsTreeBuf[96:])
+		// First pass: collect candidate children's bytenrs into a
+		// local-scope index range on the worklist itself. Because
+		// LIFO pop visits last-pushed first, push left-to-right and
+		// the deepest leftmost descent wins.
+		for i := uint32(0); i < nritems; i++ {
+			off := uint32(btrfsHeaderSize) + i*btrfsKeyPtrSize
+			if off+btrfsKeyPtrSize > nodesize {
+				break
+			}
+			thisObj := le64(btrfsTreeBuf[off:])
+			if thisObj > parentDirInode {
+				// Sorted ascending — all subsequent children also above.
+				break
+			}
+			nextObj := uint64(0xFFFFFFFFFFFFFFFF)
+			if i+1 < nritems {
+				nOff := uint32(btrfsHeaderSize) + (i+1)*btrfsKeyPtrSize
+				if nOff+btrfsKeyPtrSize <= nodesize {
+					nextObj = le64(btrfsTreeBuf[nOff:])
+				}
+			}
+			if nextObj < parentDirInode {
+				// This entire child sits below target_objectid.
+				continue
+			}
+			childBytenr := le64(btrfsTreeBuf[off+17:])
+			if btrfsWalkCount >= len(btrfsWalkBytenr) {
+				break
+			}
+			btrfsWalkBytenr[btrfsWalkCount] = childBytenr
+			btrfsWalkLevel[btrfsWalkCount] = actualLevel - 1
+			btrfsWalkCount++
 		}
 	}
 	_ = co
@@ -2163,11 +2194,23 @@ func dumpBtrfsLeafAll(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz ui
 // actually present at a given inode level (snapshot subvolume names,
 // "@", etc. on distributions that don't put the user-visible root
 // directly under inode 256).
+//
+// Handles level-0 (single leaf) AND level-1 (internal node pointing
+// to leaf blocks) FS trees. Depth ≥ 2 returns silently.
+// listBtrfsDirChildPtrs is the dedicated scratch for listBtrfsDir's
+// internal-node walk. We don't share btrfsWalkBytenr/Level with
+// findInBtrfsDirPrefix because they have different ownership
+// semantics — this one only buffers within a single function call.
+var (
+	listBtrfsDirChildPtrs [256]uint64
+	listBtrfsDirChildCnt  int
+)
+
 func listBtrfsDir(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
 	fsTreeLogical uint64, fsTreeLevel uint8, nodesize uint32,
 	parentDirInode uint64,
 ) {
-	if fsTreeLevel != 0 {
+	if fsTreeLevel > 1 {
 		return
 	}
 	phys, ok := btrfsLogicalToPhys(fsTreeLogical)
@@ -2178,10 +2221,48 @@ func listBtrfsDir(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32
 		unsafe.Pointer(&btrfsTreeBuf[0])) {
 		return
 	}
-	nritems := le32(btrfsTreeBuf[96:])
 	writeASCII(co, "    contents of inode ")
 	writeDec(co, parentDirInode)
 	writeASCII(co, ":\r\n")
+	actualLevel := btrfsTreeBuf[100]
+	if actualLevel == 0 {
+		dumpBtrfsDirLeaf(co, parentDirInode, nodesize)
+		return
+	}
+	// Internal node — collect children, then walk each.
+	nritems := le32(btrfsTreeBuf[96:])
+	listBtrfsDirChildCnt = 0
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsKeyPtrSize
+		if off+btrfsKeyPtrSize > nodesize {
+			break
+		}
+		if listBtrfsDirChildCnt >= len(listBtrfsDirChildPtrs) {
+			break
+		}
+		listBtrfsDirChildPtrs[listBtrfsDirChildCnt] = le64(btrfsTreeBuf[off+17:])
+		listBtrfsDirChildCnt++
+	}
+	for j := 0; j < listBtrfsDirChildCnt; j++ {
+		cphys, ok := btrfsLogicalToPhys(listBtrfsDirChildPtrs[j])
+		if !ok {
+			continue
+		}
+		if !readBtrfsBlock(bio, mediaId, devBlkSz, cphys, nodesize,
+			unsafe.Pointer(&btrfsTreeBuf[0])) {
+			continue
+		}
+		if btrfsTreeBuf[100] != 0 {
+			continue
+		}
+		dumpBtrfsDirLeaf(co, parentDirInode, nodesize)
+	}
+}
+
+// dumpBtrfsDirLeaf prints every DIR_INDEX_KEY under parentDirInode in
+// the leaf currently sitting in btrfsTreeBuf.
+func dumpBtrfsDirLeaf(co *efiSimpleTextOutput, parentDirInode uint64, nodesize uint32) {
+	nritems := le32(btrfsTreeBuf[96:])
 	for i := uint32(0); i < nritems; i++ {
 		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
 		if off+btrfsItemSize > nodesize {
@@ -2339,7 +2420,18 @@ func scanSubvolumesForKernel(co *efiSimpleTextOutput, bio uintptr, mediaId, devB
 	writeDec(co, uint64(candCount))
 	writeASCII(co, " candidates\r\n")
 
+	// Highest objectid seen — used for the diagnostic dump below
+	// when nothing matches (most recent snapshot is the likely
+	// "active" one on openSUSE MicroOS).
+	var maxID uint64
+	var maxBytenr uint64
+	var maxLevel uint8
 	for k := 0; k < candCount; k++ {
+		if candIDs[k] > maxID {
+			maxID = candIDs[k]
+			maxBytenr = candBytenrs[k]
+			maxLevel = candLevels[k]
+		}
 		// Try /vmlinuz-* at the subvolume's root first (RHEL-style
 		// "/boot is the subvolume root").
 		kIno, ok := findInBtrfsDirPrefix(co, bio, mediaId, devBlkSz,
@@ -2358,9 +2450,27 @@ func scanSubvolumesForKernel(co *efiSimpleTextOutput, bio uintptr, mediaId, devB
 			btrfsKernelDirInode = btrfsFirstFreeObjectID
 			return true
 		}
-		// Fall back to /boot/vmlinuz-*. findInBtrfsDirPrefix matches
-		// names that *start with* prefix — "boot" works as a prefix
-		// of "boot" itself (the dir entry being looked for here).
+		// Same with /Image-* — openSUSE arm64 convention.
+		kIno, ok = findInBtrfsDirPrefix(co, bio, mediaId, devBlkSz,
+			candBytenrs[k], candLevels[k], nodesize,
+			btrfsFirstFreeObjectID, imagePrefix[:],
+			&btrfsScanName, &btrfsScanNameLen)
+		if ok {
+			writeASCII(co, "      subvol ")
+			writeDec(co, candIDs[k])
+			writeASCII(co, " has /Image-* (ino=")
+			writeDec(co, kIno)
+			writeASCII(co, ")\r\n")
+			btrfsKernelSubvolRootID = candIDs[k]
+			btrfsKernelBytenr = candBytenrs[k]
+			btrfsKernelLevel = candLevels[k]
+			btrfsKernelDirInode = btrfsFirstFreeObjectID
+			return true
+		}
+		// Fall back to /boot/vmlinuz-* or /boot/Image-*.
+		// findInBtrfsDirPrefix matches names that *start with*
+		// prefix — "boot" works as a prefix of "boot" itself (the
+		// dir entry being looked for here).
 		bIno, hasBoot := findInBtrfsDirPrefix(co, bio, mediaId, devBlkSz,
 			candBytenrs[k], candLevels[k], nodesize,
 			btrfsFirstFreeObjectID, btrfsBootName[:],
@@ -2382,9 +2492,37 @@ func scanSubvolumesForKernel(co *efiSimpleTextOutput, bio uintptr, mediaId, devB
 				btrfsKernelDirInode = bIno
 				return true
 			}
+			kIno2, ok2 = findInBtrfsDirPrefix(co, bio, mediaId, devBlkSz,
+				candBytenrs[k], candLevels[k], nodesize,
+				bIno, imagePrefix[:],
+				&btrfsScanName, &btrfsScanNameLen)
+			if ok2 {
+				writeASCII(co, "      subvol ")
+				writeDec(co, candIDs[k])
+				writeASCII(co, " has /boot/Image-* (ino=")
+				writeDec(co, kIno2)
+				writeASCII(co, ")\r\n")
+				btrfsKernelSubvolRootID = candIDs[k]
+				btrfsKernelBytenr = candBytenrs[k]
+				btrfsKernelLevel = candLevels[k]
+				btrfsKernelDirInode = bIno
+				return true
+			}
 		}
 	}
-	writeASCII(co, "    no subvolume carries vmlinuz-*\r\n")
+	writeASCII(co, "    no subvolume carries vmlinuz-* or Image-*\r\n")
+	// Diagnostic: dump the highest-numbered subvol's root inode 256
+	// contents so we can see what's actually in there. On MicroOS
+	// the most recent snapshot is the likely active one, and seeing
+	// its contents tells us whether the kernel is nested under some
+	// other path we haven't tried yet.
+	if maxID != 0 {
+		writeASCII(co, "    dump of subvol ")
+		writeDec(co, maxID)
+		writeASCII(co, " root inode 256:\r\n")
+		listBtrfsDir(co, bio, mediaId, devBlkSz,
+			maxBytenr, maxLevel, nodesize, btrfsFirstFreeObjectID)
+	}
 	return false
 }
 
