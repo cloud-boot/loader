@@ -406,7 +406,27 @@ var (
 	// without triggering TinyGo's escape-to-heap path — which would
 	// reach runtime.alloc → VirtualAlloc and crash here.
 	scratchSize uintptr
+
+	// CloudBootTarget shortcut tags. When the staged value matches
+	// one of these, _start skips ahead in the cascade.
+	ext4DirectTag = [...]byte{'e', 'x', 't', '4', '-', 'd', 'i', 'r', 'e', 'c', 't'}
+	xfsDirectTag  = [...]byte{'x', 'f', 's', '-', 'd', 'i', 'r', 'e', 'c', 't'}
 )
+
+// bytesMatchTarget returns true if `tag` equals the CloudBootTarget
+// value most-recently read by readTargetEFIVar (i.e. targetRaw[:
+// targetRawLen]). Closure-free per the no-heap convention.
+func bytesMatchTarget(tag []byte) bool {
+	if int(targetRawLen) != len(tag) {
+		return false
+	}
+	for i := 0; i < len(tag); i++ {
+		if targetRaw[i] != tag[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // readTargetEFIVar fetches the host-staged UKI target name from the
 // `CloudBootTarget` UEFI variable. The value is plain ASCII (no NUL
@@ -916,39 +936,49 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	readTargetEFIVar(co, rt)
 	buildUKIPath()
 
-	// Step 1: enumerate every SimpleFileSystem handle. ByProtocol
-	// search (SearchType=2) plus the EFI_SIMPLE_FILE_SYSTEM GUID
-	// gives us every FAT/exfat/iso9660 volume the firmware exposes,
-	// which is what holds our UKI.
-	sfsHandleCount = 0
-	sfsHandleBuf = 0
-	status := efiCall5(bs.locateHandleBuffer,
-		uintptr(2),
-		uintptr(unsafe.Pointer(&simpleFileSystemGUID)),
-		0,
-		uintptr(unsafe.Pointer(&sfsHandleCount)),
-		uintptr(unsafe.Pointer(&sfsHandleBuf)))
-	if status != efiSuccess || sfsHandleCount == 0 {
-		writeASCII(co, "no SimpleFileSystem handles (status=")
-		writeHex64(co, status)
-		writeASCII(co, ")\r\n")
-		for {
-		}
-	}
-	writeASCII(co, "SimpleFileSystem handles: ")
-	writeHex64(co, uint64(sfsHandleCount))
-	writeASCII(co, "\r\n")
+	// CloudBootTarget shortcuts. The variable normally names a UKI
+	// under \EFI\Linux\<target>.efi, but three special values let
+	// the host force a specific cascade entry:
+	//
+	//   "ext4-direct" — skip FAT entirely, go straight to ext4
+	//                    cloud-disk fallback.
+	//   "xfs-direct"  — skip FAT and ext4, go straight to xfs
+	//                    cloud-disk fallback.
+	//   anything else — normal FAT-volume UKI lookup, with
+	//                    cloud-disk fallback if nothing matches.
+	skipFAT := bytesMatchTarget(ext4DirectTag[:])
+	skipExt4 := bytesMatchTarget(xfsDirectTag[:])
 
-	// Step 2: try each volume for the resolved target. If a custom
-	// target was set via CloudBootTarget and it isn't on any volume,
-	// fall back to the "cloud-boot" default before giving up.
-	loaded := tryAllHandles(co, bs, imageHandle)
-	if !loaded && targetRawLen > 0 {
-		writeASCII(co, "  target UKI not found, falling back to cloud-boot.efi\r\n")
-		targetRawLen = 0
-		buildUKIPath()
-		loaded = tryAllHandles(co, bs, imageHandle)
+	loaded := false
+	if !skipFAT && !skipExt4 {
+		// Step 1: enumerate every SimpleFileSystem handle.
+		sfsHandleCount = 0
+		sfsHandleBuf = 0
+		status := efiCall5(bs.locateHandleBuffer,
+			uintptr(2),
+			uintptr(unsafe.Pointer(&simpleFileSystemGUID)),
+			0,
+			uintptr(unsafe.Pointer(&sfsHandleCount)),
+			uintptr(unsafe.Pointer(&sfsHandleBuf)))
+		if status == efiSuccess && sfsHandleCount > 0 {
+			writeASCII(co, "SimpleFileSystem handles: ")
+			writeHex64(co, uint64(sfsHandleCount))
+			writeASCII(co, "\r\n")
+			// Step 2: try each volume for the resolved target.
+			loaded = tryAllHandles(co, bs, imageHandle)
+			if !loaded && targetRawLen > 0 {
+				writeASCII(co, "  target UKI not found, falling back to cloud-boot.efi\r\n")
+				targetRawLen = 0
+				buildUKIPath()
+				loaded = tryAllHandles(co, bs, imageHandle)
+			}
+		} else {
+			writeASCII(co, "no SimpleFileSystem handles, going to cloud-disk\r\n")
+		}
+	} else {
+		writeASCII(co, "CloudBootTarget shortcut: skipping FAT UKI lookup\r\n")
 	}
+
 	if !loaded {
 		// Phase 5d fallback: walk BlockIO handles for an ext4
 		// partition whose /boot has vmlinuz-* + initrd.img-*. This
@@ -975,9 +1005,9 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	// and runs Linux. On failure (a non-EFI image, a stub that exits
 	// without ExitBootServices, etc.) we land back here.
 	writeASCII(co, "StartImage...\r\n")
-	status = efiCall3(bs.startImage, childImageHandle, 0, 0)
+	rc := efiCall3(bs.startImage, childImageHandle, 0, 0)
 	writeASCII(co, "StartImage returned: ")
-	writeHex64(co, status)
+	writeHex64(co, rc)
 	writeASCII(co, "\r\n")
 	for {
 	}
