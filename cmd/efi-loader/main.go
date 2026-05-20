@@ -1027,6 +1027,13 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 						uintptr(len(netMarkVarData)),
 						uintptr(unsafe.Pointer(&netMarkVarData[0])))
 				}
+				// Phase D1: virtio device-init handshake. Resets
+				// the device, runs feature negotiation, latches
+				// FEATURES_OK. Required before any virtqueue work
+				// (Phase D2) can program queue addresses. Marker:
+				// VN-FOK on success.
+				bsGlobal = bs
+				vnetNegotiate(co)
 			}
 		}
 	}
