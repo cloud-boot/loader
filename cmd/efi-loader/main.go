@@ -1010,7 +1010,25 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 		// (memory:loader-network-stack-roadmap, option 1 of the
 		// VZ-pivot question). Result lands in CloudBootMark =
 		// PCI-NETOK / PCI-NONET / PCI-NONE.
-		pciInit(co, bs)
+		if pciInit(co, bs) {
+			// Phase C: walk the virtio capability chain on the
+			// found PCI device, locate the DEVICE_CFG sub-page,
+			// read the MAC out of it. CloudBootMark = VN-MACOK
+			// on success.
+			if vnetInit(co) {
+				for i := 0; i < 6; i++ {
+					netMarkVarData[i] = vnetLocalMAC[i]
+				}
+				if rt != nil && rt.setVariable != 0 {
+					efiCall5(rt.setVariable,
+						uintptr(unsafe.Pointer(&netMacVarName[0])),
+						uintptr(unsafe.Pointer(&cloudBootGUID)),
+						uintptr(0x07),
+						uintptr(len(netMarkVarData)),
+						uintptr(unsafe.Pointer(&netMarkVarData[0])))
+				}
+			}
+		}
 	}
 
 	writeASCII(co, "cloud-boot/loader — phase 5b/5c/5d\r\n")
