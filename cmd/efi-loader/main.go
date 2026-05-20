@@ -1002,6 +1002,15 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 				uintptr(len(netMarkVarData)),
 				uintptr(unsafe.Pointer(&netMarkVarData[0])))
 		}
+	} else {
+		// SNP wasn't available (typical on Apple VZ). Phase B
+		// fallback: enumerate PCI directly and look for virtio-net.
+		// This sets up the foundation for the DIY virtio-net stack
+		// that the eventual OCI plan fetch will sit on
+		// (memory:loader-network-stack-roadmap, option 1 of the
+		// VZ-pivot question). Result lands in CloudBootMark =
+		// PCI-NETOK / PCI-NONET / PCI-NONE.
+		pciInit(co, bs)
 	}
 
 	writeASCII(co, "cloud-boot/loader — phase 5b/5c/5d\r\n")
