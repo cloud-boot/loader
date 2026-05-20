@@ -21,6 +21,7 @@ vars:
   FEDORA_RAW:           '{{.TASKFILE_DIR}}/../uki/.fedora-cache/41/arm64/genericcloud.raw'
   UBUNTU_RAW:           '{{.TASKFILE_DIR}}/../uki/.ubuntu-cache/noble/arm64/genericcloud.raw'
   MICROOS_RAW:          '{{.TASKFILE_DIR}}/../uki/.suse-cache/microos/arm64/microos.raw'
+  ALPINE_RAW:           '{{.TASKFILE_DIR}}/../uki/.alpine-cache/3.21/aarch64/cloud/alpine.raw'
 
 tasks:
 
@@ -482,6 +483,43 @@ tasks:
       - >-
         qemu-system-aarch64
         -machine virt,gic-version=max,accel=hvf:tcg -cpu max -m 2048 -smp 2
+        -drive if=pflash,format=raw,readonly=on,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd
+        -drive if=pflash,format=raw,file=ovmf_vars_arm64.fd
+        -drive if=virtio,format=raw,file=esp.img,id=esp
+        -drive if=virtio,format=qcow2,file=cloud-overlay.qcow2,id=cloud
+        -nographic -serial mon:stdio
+
+  # qemu-loader-alpine-arm64: production loader vs an unmodified Alpine
+  # Linux arm64 AWS cloud image (VHD converted to raw — Alpine doesn't
+  # publish a generic raw cloud image but the AWS variant works fine
+  # in qemu/vfkit since it's just a GPT-partitioned ext4 disk under
+  # an ESP). Layout: small ESP (512 KiB, FAT16) + ext4 rootfs with
+  # /boot inside. The ext4 walker drives the entire boot.
+  #
+  # CMDLINE uses Alpine's initramfs init-script syntax: `modules=...`
+  # to ensure the right block-device drivers load, and `root=/dev/vda2`
+  # (NOT vda1 — partition 1 in our GPT is the ESP, rootfs is partition 2).
+  qemu-loader-alpine-arm64:
+    desc: Boot the loader against an unmodified Alpine Linux 3.21 arm64 cloud image.
+    deps: [loader-arm64, efivar-stage]
+    dir: cmd/efi-loader
+    preconditions:
+      - sh: 'test -f "{{.ALPINE_RAW}}"'
+        msg: 'Alpine cloud image missing — fetch with `curl -o ../uki/.alpine-cache/3.21/aarch64/cloud/alpine.vhd https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/aws_alpine-3.21.0-aarch64-uefi-cloudinit-metal-r1.vhd` then `qemu-img convert -f vpc -O raw alpine.vhd alpine.raw`.'
+    vars:
+      CMDLINE: '{{.CMDLINE | default "console=ttyAMA0 root=/dev/vda2 modules=virtio_pci,virtio_blk,sd-mod,usb-storage,ext4 rw"}}'
+    cmds:
+      - rm -f esp.img ovmf_vars_arm64.fd cloud-overlay.qcow2
+      - dd if=/dev/zero of=ovmf_vars_arm64.fd bs=1M count=64 status=none
+      - dd if=/dev/zero of=esp.img bs=1M count=64 status=none
+      - "mformat -i esp.img -F ::"
+      - "mmd -i esp.img ::EFI ::EFI/BOOT"
+      - "mcopy -i esp.img {{.LOADER_ARM64_OUT}} ::EFI/BOOT/BOOTAA64.EFI"
+      - ../efivar-stage/efivar-stage -store ovmf_vars_arm64.fd -cmdline "{{.CMDLINE}}"
+      - qemu-img create -f qcow2 -F raw -b {{.ALPINE_RAW}} cloud-overlay.qcow2 > /dev/null
+      - >-
+        qemu-system-aarch64
+        -machine virt,gic-version=max,accel=hvf:tcg -cpu max -m 1024 -smp 2
         -drive if=pflash,format=raw,readonly=on,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd
         -drive if=pflash,format=raw,file=ovmf_vars_arm64.fd
         -drive if=virtio,format=raw,file=esp.img,id=esp
