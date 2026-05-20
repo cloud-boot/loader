@@ -747,6 +747,15 @@ func tryCloudDiskBoot(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle 
 	}
 	loadedKernelSize = got
 
+	// If the kernel is gzip-wrapped (Ubuntu arm64 ships
+	// /boot/vmlinuz-*-generic that way), decompress into a fresh
+	// pool buffer and swap kernelBufPtr to the inflated copy.
+	if isGzipped(kernelBufPtr) {
+		if !maybeInflateKernel(co, bs, got) {
+			return false
+		}
+	}
+
 	// Find + read initrd in the same directory the kernel came from.
 	// Try Debian "initrd.img-*" first, then RHEL "initramfs-*.img"
 	// so a single ext4 walker handles both /boot-style and
@@ -974,15 +983,11 @@ func validatePEKernel(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz ui
 		return true
 	}
 	// "1F 8B 08 …" → gzip-compressed kernel (Ubuntu arm64 ships
-	// /boot/vmlinuz-*-generic as a gzip-compressed Image; GRUB
-	// decompresses it before LoadImage). We'd need an inflate
-	// implementation to handle this — out of scope for the
-	// no-heap-under-UEFI loader without a substantial dependency.
-	// Reject and let the caller move on (other distros'
-	// uncompressed Image-format kernels still work).
+	// /boot/vmlinuz-*-generic as a gzip-wrapped raw Image). We
+	// accept these too — the post-readFile gzipDecompress pass in
+	// tryCloudDiskBoot inflates them before LoadImage.
 	if dirBuf[0] == 0x1F && dirBuf[1] == 0x8B {
-		writeASCII(co, " (gzip-compressed kernel — not directly EFI-bootable)\r\n")
-		return false
+		return true
 	}
 	return false
 }
