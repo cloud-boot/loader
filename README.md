@@ -14,10 +14,10 @@ original target since Apple VZ traps `kexec_file_load` on arm64).
 | Family | Filesystem layout | QEMU/OVMF | Apple VZ |
 | --- | --- | --- | --- |
 | Debian Trixie | ext4 rootfs (/boot inside) | ✓ login prompt | ✓ login prompt + shutdown |
-| Ubuntu Noble 24.04 | ext4 rootfs + gzip-compressed vmlinuz | ✓ systemd 255.4 running | — |
-| Fedora 41 | ext4 /boot + btrfs / | ✓ Basic System | — |
-| AlmaLinux 9 / RHEL family | xfs /boot + xfs / | ✓ systemd target | — |
-| openSUSE Leap Micro 6.2 | btrfs (default-subvol snapshot) | ✓ JeOS Firstboot | — |
+| Ubuntu Noble 24.04 | ext4 rootfs + gzip-compressed vmlinuz | ✓ systemd 255.4 running | ✓ systemd timed-out networkd, clean shutdown |
+| Fedora 41 | ext4 /boot + btrfs / | ✓ Basic System | ✓ Basic System |
+| AlmaLinux 9 / RHEL family | xfs /boot + xfs / | ✓ systemd target | ✓ login prompt + shutdown |
+| openSUSE Leap Micro 6.2 | btrfs (default-subvol snapshot) | ✓ JeOS Firstboot | ✓ JeOS Firstboot + shutdown |
 | Alpine Linux 3.21 | ext4 rootfs (AWS variant) | ✓ cloud-init started | ✓ cloud-init started |
 
 amd64 cross-compiles clean (BOOTX64.EFI), untested in this round.

@@ -558,63 +558,176 @@ tasks:
         -drive if=virtio,format=qcow2,file=cloud-overlay.qcow2,id=cloud
         -nographic -serial mon:stdio
 
-  # vfkit-loader-cloud-arm64: production loader on real Apple
-  # Virtualization.framework via vfkit (Red Hat / crc-org). Same
-  # ext4 cloud-disk fallback as qemu-loader-cloud-arm64, but
-  # exercised under Apple's UEFI implementation instead of OVMF —
-  # which is the entire reason the loader exists (kexec_file_load
-  # is trapped under VZ).
+  # ----- vfkit-loader-*-arm64 (real Apple Virtualization.framework) -----
+  #
+  # Each target stages an upstream cloud image into a writable copy
+  # under /tmp/vz-test/<name>.raw (via scripts/stage-vz-image.sh,
+  # which auto-detects the ESP via GPT scan, overlays our
+  # BOOTAA64.EFI and a `\cmdline` file at the FAT root), then runs
+  # vfkit pointed at that image.
   #
   # Apple's UEFI routes SimpleTextOutput to the framebuffer only,
-  # so we can't see the loader's writeASCII traffic. Instead we
-  # rely on:
-  #   1. CloudBootMark non-volatile EFI variable (set as the very
-  #      first thing in _start), inspectable in the resulting
-  #      efi-vars.fd after the VM stops.
-  #   2. Linux kernel writing to virtio-serial once started (the
-  #      \cmdline file embedded in the modified ESP carries
-  #      console=hvc0).
+  # so we can't see the loader's own writeASCII traffic. Two
+  # side-channels confirm execution:
+  #   1. CloudBootMark non-volatile EFI variable, stamped as the
+  #      very first action in _start. Survives in the post-run
+  #      varstore file at /tmp/vz-test/vfkit/<name>-vars.fd —
+  #      `python3 -c "import sys; print('CB-RAN' in open(sys.argv[1],'rb').read())" file.fd`
+  #   2. The Linux kernel writing to virtio-serial once started
+  #      (the staged `\cmdline` carries console=hvc0). Output
+  #      lands in /tmp/vz-test/vfkit/<name>-serial.log.
   #
-  # The Debian image is mutated in-place: ESP partition extracted,
-  # our BOOTAA64.EFI overlaid at \EFI\BOOT\BOOTAA64.EFI alongside
-  # a \cmdline file, then written back. After the run inspect
-  # /tmp/vz-test/vfkit/serial-mod.log for kernel output and
-  # /tmp/vz-test/vfkit/efi-vars-mod.fd for the marker variable.
+  # The --gui flag opens an interactive window; close it (or the
+  # VM powers off cleanly) to end the run.
+  #
+  # The original target was Debian. Apple VZ on arm64 traps
+  # kexec_file_load, which is exactly what cloud-boot's init/+UKI
+  # pipeline relies on — pure-UEFI LoadImage+StartImage is the
+  # alternative, and VZ supports it natively because it's the
+  # same firmware-mediated transition every distro installer uses.
+
   vfkit-loader-cloud-arm64:
-    desc: Boot the production loader on real Apple Virtualization.framework via vfkit.
+    desc: Boot the loader on real Apple VZ against an unmodified Debian cloud image.
     deps: [loader-arm64]
-    dir: cmd/efi-loader
+    dir: '{{.TASKFILE_DIR}}'
     preconditions:
       - sh: 'test -f "{{.DEBIAN_RAW}}"'
-        msg: 'Debian cloud image missing — fetch it first with `ARCH=arm64 task -t ../../uki/Taskfile.yaml label:debian:cloud`.'
+        msg: 'Debian cloud image missing — `ARCH=arm64 task -t ../uki/Taskfile.yaml label:debian:cloud`.'
       - sh: 'which vfkit > /dev/null'
-        msg: 'vfkit not installed — run `brew install vfkit` first.'
+        msg: 'vfkit not installed — `brew install vfkit`.'
     vars:
       CMDLINE: '{{.CMDLINE | default "console=hvc0 root=LABEL=cloudimg-rootfs ro"}}'
-      VZTEST:  /tmp/vz-test
     cmds:
-      - mkdir -p {{.VZTEST}}/vfkit
-      # Copy the raw Debian cloud image into a writable working copy.
-      - cp {{.DEBIAN_RAW}} {{.VZTEST}}/debian.raw
-      # Extract the ESP (GPT partition 15 on Debian arm64
-      # genericcloud: starts at LBA 2048, runs 260096 sectors =
-      # 127 MiB), overlay our loader + cmdline, write back.
-      - dd if={{.VZTEST}}/debian.raw of={{.VZTEST}}/esp.img bs=512 skip=2048 count=260096 status=none
-      - mcopy -o -i {{.VZTEST}}/esp.img {{.LOADER_ARM64_OUT}} ::EFI/BOOT/BOOTAA64.EFI
-      - echo -n "{{.CMDLINE}}" > {{.VZTEST}}/cmdline.txt
-      - mcopy -o -i {{.VZTEST}}/esp.img {{.VZTEST}}/cmdline.txt ::cmdline
-      - dd if={{.VZTEST}}/esp.img of={{.VZTEST}}/debian.raw bs=512 seek=2048 count=260096 conv=notrunc status=none
-      # Fresh varstore on every run — the previous run's
-      # CloudBootMark variable would otherwise persist and obscure
-      # what THIS run did.
-      - rm -f {{.VZTEST}}/vfkit/efi-vars.fd {{.VZTEST}}/vfkit/serial.log
+      - mkdir -p /tmp/vz-test/vfkit
+      - scripts/stage-vz-image.sh {{.DEBIAN_RAW}} /tmp/vz-test/debian.raw cmd/efi-loader/{{.LOADER_ARM64_OUT}} "{{.CMDLINE}}"
+      - rm -f /tmp/vz-test/vfkit/debian-vars.fd /tmp/vz-test/vfkit/debian-serial.log
       - >-
         vfkit --cpus 2 --memory 2048
-        --bootloader efi,variable-store={{.VZTEST}}/vfkit/efi-vars.fd,create
-        --device virtio-blk,path={{.VZTEST}}/debian.raw
-        --device virtio-serial,logFilePath={{.VZTEST}}/vfkit/serial.log
+        --bootloader efi,variable-store=/tmp/vz-test/vfkit/debian-vars.fd,create
+        --device virtio-blk,path=/tmp/vz-test/debian.raw
+        --device virtio-serial,logFilePath=/tmp/vz-test/vfkit/debian-serial.log
         --device virtio-rng
         --device virtio-net,nat,mac=72:20:43:d4:38:01
+        --gui
+
+  vfkit-loader-ubuntu-arm64:
+    desc: Boot the loader on real Apple VZ against an unmodified Ubuntu Noble cloud image.
+    deps: [loader-arm64]
+    dir: '{{.TASKFILE_DIR}}'
+    preconditions:
+      - sh: 'test -f "{{.UBUNTU_RAW}}"'
+        msg: 'Ubuntu cloud image missing — fetch into ../uki/.ubuntu-cache/noble/arm64/genericcloud.raw first.'
+      - sh: 'which vfkit > /dev/null'
+        msg: 'vfkit not installed — `brew install vfkit`.'
+    vars:
+      CMDLINE: '{{.CMDLINE | default "console=hvc0 root=LABEL=cloudimg-rootfs ro"}}'
+    cmds:
+      - mkdir -p /tmp/vz-test/vfkit
+      - scripts/stage-vz-image.sh {{.UBUNTU_RAW}} /tmp/vz-test/ubuntu.raw cmd/efi-loader/{{.LOADER_ARM64_OUT}} "{{.CMDLINE}}"
+      - rm -f /tmp/vz-test/vfkit/ubuntu-vars.fd /tmp/vz-test/vfkit/ubuntu-serial.log
+      - >-
+        vfkit --cpus 2 --memory 2048
+        --bootloader efi,variable-store=/tmp/vz-test/vfkit/ubuntu-vars.fd,create
+        --device virtio-blk,path=/tmp/vz-test/ubuntu.raw
+        --device virtio-serial,logFilePath=/tmp/vz-test/vfkit/ubuntu-serial.log
+        --device virtio-rng
+        --device virtio-net,nat,mac=72:20:43:d4:38:02
+        --gui
+
+  vfkit-loader-fedora-arm64:
+    desc: Boot the loader on real Apple VZ against an unmodified Fedora 41 cloud image.
+    deps: [loader-arm64]
+    dir: '{{.TASKFILE_DIR}}'
+    preconditions:
+      - sh: 'test -f "{{.FEDORA_RAW}}"'
+        msg: 'Fedora cloud image missing — fetch into ../uki/.fedora-cache/41/arm64/genericcloud.raw first.'
+      - sh: 'which vfkit > /dev/null'
+        msg: 'vfkit not installed — `brew install vfkit`.'
+    vars:
+      CMDLINE: '{{.CMDLINE | default "console=hvc0 root=/dev/vda5 ro"}}'
+    cmds:
+      - mkdir -p /tmp/vz-test/vfkit
+      - scripts/stage-vz-image.sh {{.FEDORA_RAW}} /tmp/vz-test/fedora.raw cmd/efi-loader/{{.LOADER_ARM64_OUT}} "{{.CMDLINE}}"
+      - rm -f /tmp/vz-test/vfkit/fedora-vars.fd /tmp/vz-test/vfkit/fedora-serial.log
+      - >-
+        vfkit --cpus 2 --memory 2048
+        --bootloader efi,variable-store=/tmp/vz-test/vfkit/fedora-vars.fd,create
+        --device virtio-blk,path=/tmp/vz-test/fedora.raw
+        --device virtio-serial,logFilePath=/tmp/vz-test/vfkit/fedora-serial.log
+        --device virtio-rng
+        --device virtio-net,nat,mac=72:20:43:d4:38:03
+        --gui
+
+  vfkit-loader-alma-arm64:
+    desc: Boot the loader on real Apple VZ against an unmodified AlmaLinux 9 cloud image.
+    deps: [loader-arm64]
+    dir: '{{.TASKFILE_DIR}}'
+    preconditions:
+      - sh: 'test -f "{{.ALMA_RAW}}"'
+        msg: 'AlmaLinux cloud image missing — fetch into ../uki/.alma-cache/9/arm64/genericcloud.raw first.'
+      - sh: 'which vfkit > /dev/null'
+        msg: 'vfkit not installed — `brew install vfkit`.'
+    vars:
+      CMDLINE: '{{.CMDLINE | default "console=hvc0 root=/dev/vda3 ro"}}'
+    cmds:
+      - mkdir -p /tmp/vz-test/vfkit
+      - scripts/stage-vz-image.sh {{.ALMA_RAW}} /tmp/vz-test/alma.raw cmd/efi-loader/{{.LOADER_ARM64_OUT}} "{{.CMDLINE}}"
+      - rm -f /tmp/vz-test/vfkit/alma-vars.fd /tmp/vz-test/vfkit/alma-serial.log
+      - >-
+        vfkit --cpus 2 --memory 2048
+        --bootloader efi,variable-store=/tmp/vz-test/vfkit/alma-vars.fd,create
+        --device virtio-blk,path=/tmp/vz-test/alma.raw
+        --device virtio-serial,logFilePath=/tmp/vz-test/vfkit/alma-serial.log
+        --device virtio-rng
+        --device virtio-net,nat,mac=72:20:43:d4:38:04
+        --gui
+
+  vfkit-loader-microos-arm64:
+    desc: Boot the loader on real Apple VZ against an unmodified openSUSE Leap Micro 6.2 image.
+    deps: [loader-arm64]
+    dir: '{{.TASKFILE_DIR}}'
+    preconditions:
+      - sh: 'test -f "{{.MICROOS_RAW}}"'
+        msg: 'openSUSE MicroOS cloud image missing — fetch into ../uki/.suse-cache/microos/arm64/microos.raw first.'
+      - sh: 'which vfkit > /dev/null'
+        msg: 'vfkit not installed — `brew install vfkit`.'
+    vars:
+      CMDLINE: '{{.CMDLINE | default "console=hvc0 root=LABEL=ROOT ro"}}'
+    cmds:
+      - mkdir -p /tmp/vz-test/vfkit
+      - scripts/stage-vz-image.sh {{.MICROOS_RAW}} /tmp/vz-test/microos.raw cmd/efi-loader/{{.LOADER_ARM64_OUT}} "{{.CMDLINE}}"
+      - rm -f /tmp/vz-test/vfkit/microos-vars.fd /tmp/vz-test/vfkit/microos-serial.log
+      - >-
+        vfkit --cpus 2 --memory 2048
+        --bootloader efi,variable-store=/tmp/vz-test/vfkit/microos-vars.fd,create
+        --device virtio-blk,path=/tmp/vz-test/microos.raw
+        --device virtio-serial,logFilePath=/tmp/vz-test/vfkit/microos-serial.log
+        --device virtio-rng
+        --device virtio-net,nat,mac=72:20:43:d4:38:05
+        --gui
+
+  vfkit-loader-alpine-arm64:
+    desc: Boot the loader on real Apple VZ against an unmodified Alpine 3.21 cloud image.
+    deps: [loader-arm64]
+    dir: '{{.TASKFILE_DIR}}'
+    preconditions:
+      - sh: 'test -f "{{.ALPINE_RAW}}"'
+        msg: 'Alpine cloud image missing.'
+      - sh: 'which vfkit > /dev/null'
+        msg: 'vfkit not installed — `brew install vfkit`.'
+    vars:
+      CMDLINE: '{{.CMDLINE | default "console=hvc0 root=/dev/vda2 modules=virtio_pci,virtio_blk,sd-mod,usb-storage,ext4 rw"}}'
+    cmds:
+      - mkdir -p /tmp/vz-test/vfkit
+      - scripts/stage-vz-image.sh {{.ALPINE_RAW}} /tmp/vz-test/alpine.raw cmd/efi-loader/{{.LOADER_ARM64_OUT}} "{{.CMDLINE}}"
+      - rm -f /tmp/vz-test/vfkit/alpine-vars.fd /tmp/vz-test/vfkit/alpine-serial.log
+      - >-
+        vfkit --cpus 2 --memory 2048
+        --bootloader efi,variable-store=/tmp/vz-test/vfkit/alpine-vars.fd,create
+        --device virtio-blk,path=/tmp/vz-test/alpine.raw
+        --device virtio-serial,logFilePath=/tmp/vz-test/vfkit/alpine-serial.log
+        --device virtio-rng
+        --device virtio-net,nat,mac=72:20:43:d4:38:06
         --gui
 
   clean:
