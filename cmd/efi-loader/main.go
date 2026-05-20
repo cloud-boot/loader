@@ -1033,7 +1033,21 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 				// (Phase D2) can program queue addresses. Marker:
 				// VN-FOK on success.
 				bsGlobal = bs
-				vnetNegotiate(co)
+				if !vnetNegotiate(co) {
+					// Phase D1-bypass: under Apple VZ, FEATURES_OK
+					// is rejected even when the device-features +
+					// driver-features round-trip cleanly via
+					// PCI_IO. The hypothesis is that Apple's
+					// PCI_IO layer filters that specific status
+					// transition. Resolve the BAR's physical
+					// address and try the same handshake via
+					// direct MMIO. Marker: VN-BAR on success,
+					// VN-MMIO if the raw read also worked.
+					if vnetResolveBAR(co) {
+						vnetMmioSmokeTest(co)
+						vnetMmioTryFOK(co)
+					}
+				}
 			}
 		}
 	}
