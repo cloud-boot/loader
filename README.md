@@ -7,16 +7,20 @@ kernel in between. The existing `init/` + `uki/` pipeline (bootstrap
 kernel + kexec) is unchanged; this lives in parallel.
 
 A single `BOOTAA64.EFI` binary boots every major Linux distro family
-end-to-end from an unmodified cloud disk image (arm64; amd64 builds
-clean and ought to behave the same, untested in this round):
+end-to-end from an unmodified cloud disk image — under both QEMU/OVMF
+and **real Apple Virtualization.framework** (via vfkit, the project's
+original target since Apple VZ traps `kexec_file_load` on arm64).
 
-| Family | Filesystem layout | Status |
-| --- | --- | --- |
-| Debian Trixie | ext4 rootfs (/boot inside) | ✓ login prompt |
-| Ubuntu Noble 24.04 | ext4 rootfs + gzip-compressed vmlinuz | ✓ systemd 255.4 running |
-| Fedora 41 | ext4 /boot + btrfs / | ✓ Basic System |
-| AlmaLinux 9 / RHEL family | xfs /boot + xfs / | ✓ systemd target |
-| openSUSE Leap Micro 6.2 | btrfs (default-subvol snapshot) | ✓ JeOS Firstboot |
+| Family | Filesystem layout | QEMU/OVMF | Apple VZ |
+| --- | --- | --- | --- |
+| Debian Trixie | ext4 rootfs (/boot inside) | ✓ login prompt | ✓ login prompt + shutdown |
+| Ubuntu Noble 24.04 | ext4 rootfs + gzip-compressed vmlinuz | ✓ systemd 255.4 running | — |
+| Fedora 41 | ext4 /boot + btrfs / | ✓ Basic System | — |
+| AlmaLinux 9 / RHEL family | xfs /boot + xfs / | ✓ systemd target | — |
+| openSUSE Leap Micro 6.2 | btrfs (default-subvol snapshot) | ✓ JeOS Firstboot | — |
+| Alpine Linux 3.21 | ext4 rootfs (AWS variant) | ✓ cloud-init started | ✓ cloud-init started |
+
+amd64 cross-compiles clean (BOOTX64.EFI), untested in this round.
 
 Each filesystem driver (ext4, xfs, btrfs) sits in its own file under
 `cmd/efi-loader/`; the cascade in [`main.go`](cmd/efi-loader/main.go)
@@ -59,6 +63,10 @@ non-Linux EFI image works the same way.
 | 5e | xfs cloud-disk path: same handoff but reads RHEL-family layouts (xfs /boot + xfs /). Short-form + block-form directories, bit-packed `xfs_bmbt_rec` extents, v5 inode core. AlmaLinux 9. | done |
 | 5f | btrfs cloud-disk path: sys_chunk_array bootstrap + chunk-tree extension; default-subvol indirection; depth-N B-tree walker with key-range pruning; INODE_ITEM mode dispatch; inline-extent symlink resolution. openSUSE Leap Micro 6.2. | done |
 | 5g | Ubuntu Noble: same ext4 walker, but the cloud kernel is gzip-wrapped (`1F 8B 08 ...`). In-loader RFC 1951/1952 DEFLATE/gzip inflate into a fresh AllocatePool buffer before LoadImage. | done |
+| 5h | Alpine Linux 3.21 AWS cloud image: existing ext4 walker, no code changes. Mostly a cmdline tweak (`modules=...` for the initramfs init script + `root=/dev/vda2`, since Alpine's GPT puts the ESP at partition 1). | done |
+| 6 | Real Apple Virtualization.framework via vfkit (the project's actual target hypervisor): CloudBootMark non-volatile EFI variable as proof-of-execution side-channel since SimpleTextOutput goes to framebuffer only under Apple's UEFI; `\cmdline` file read in the cloud-disk paths (was previously gated on a UKI being found). Debian boots to login prompt and shuts down cleanly. | done |
+| 7 | NixOS arm64: systemd-boot `/loader/entries/*.conf` parsing → kernel + initrd path lookup at content-addressed `/EFI/nixos/<hash>-{bzImage.efi,initrd}`. Code path TBD — no obvious source of prebuilt NixOS arm64 cloud disk images (Hydra builds exist but require `nix` to download; cache.nixos.org doesn't carry the AMI). | future |
+| 8 | LVM2: PV label parse + text-format VG metadata + segment-table LV→physical resolver. Mostly a code addition — most cloud images use plain partitions, not LVM. Construction of a test image requires Linux-side `lvm2` tooling. | future |
 
 ## Phase 0 result
 
