@@ -409,8 +409,9 @@ var (
 
 	// CloudBootTarget shortcut tags. When the staged value matches
 	// one of these, _start skips ahead in the cascade.
-	ext4DirectTag = [...]byte{'e', 'x', 't', '4', '-', 'd', 'i', 'r', 'e', 'c', 't'}
-	xfsDirectTag  = [...]byte{'x', 'f', 's', '-', 'd', 'i', 'r', 'e', 'c', 't'}
+	ext4DirectTag  = [...]byte{'e', 'x', 't', '4', '-', 'd', 'i', 'r', 'e', 'c', 't'}
+	xfsDirectTag   = [...]byte{'x', 'f', 's', '-', 'd', 'i', 'r', 'e', 'c', 't'}
+	btrfsDirectTag = [...]byte{'b', 't', 'r', 'f', 's', '-', 'd', 'i', 'r', 'e', 'c', 't'}
 )
 
 // bytesMatchTarget returns true if `tag` equals the CloudBootTarget
@@ -940,14 +941,20 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	// under \EFI\Linux\<target>.efi, but three special values let
 	// the host force a specific cascade entry:
 	//
-	//   "ext4-direct" — skip FAT entirely, go straight to ext4
-	//                    cloud-disk fallback.
-	//   "xfs-direct"  — skip FAT and ext4, go straight to xfs
-	//                    cloud-disk fallback.
-	//   anything else — normal FAT-volume UKI lookup, with
-	//                    cloud-disk fallback if nothing matches.
-	skipFAT := bytesMatchTarget(ext4DirectTag[:])
-	skipExt4 := bytesMatchTarget(xfsDirectTag[:])
+	//   "ext4-direct"  — skip FAT entirely, go straight to ext4
+	//                     cloud-disk fallback.
+	//   "xfs-direct"   — skip FAT and ext4, go straight to xfs
+	//                     cloud-disk fallback.
+	//   "btrfs-direct" — skip FAT/ext4/xfs, go straight to btrfs
+	//                     cloud-disk fallback.
+	//   anything else  — normal FAT-volume UKI lookup, with
+	//                     cloud-disk fallback if nothing matches.
+	skipFAT := bytesMatchTarget(ext4DirectTag[:]) ||
+		bytesMatchTarget(xfsDirectTag[:]) ||
+		bytesMatchTarget(btrfsDirectTag[:])
+	skipExt4 := bytesMatchTarget(xfsDirectTag[:]) ||
+		bytesMatchTarget(btrfsDirectTag[:])
+	skipXfs := bytesMatchTarget(btrfsDirectTag[:])
 
 	loaded := false
 	if !skipFAT && !skipExt4 {
@@ -990,9 +997,22 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 		writeASCII(co, "no UKI found, falling back to cloud-disk\r\n")
 		// ext4 first (Debian / Ubuntu / Alpine — /boot inside rootfs).
 		// xfs second (RHEL / AlmaLinux / Rocky — separate /boot
-		// partition). Either populates childImageHandle.
-		if !tryCloudDiskBoot(co, bs, imageHandle) &&
-			!tryXfsCloudBoot(co, bs, imageHandle) {
+		// partition). btrfs third (openSUSE MicroOS / Leap Micro,
+		// snapshot-based rootfs). The CloudBootTarget=<fs>-direct
+		// shortcuts (skipExt4 / skipXfs) skip earlier rungs when the
+		// host knows which filesystem the cloud image uses, mostly
+		// for diagnostic isolation.
+		cdOK := false
+		if !skipExt4 {
+			cdOK = tryCloudDiskBoot(co, bs, imageHandle)
+		}
+		if !cdOK && !skipXfs {
+			cdOK = tryXfsCloudBoot(co, bs, imageHandle)
+		}
+		if !cdOK {
+			cdOK = tryBtrfsCloudBoot(co, bs, imageHandle)
+		}
+		if !cdOK {
 			writeASCII(co, "cloud-disk fallback failed\r\n")
 			for {
 			}
