@@ -1968,15 +1968,39 @@ const (
 // parentDirInode whose name starts with `prefix`. Returns the
 // matching child object id (file/dir inode number).
 //
-// Only handles level-0 FS_TREEs (single leaf node) for now —
-// follow-on commit adds B-tree descent for multi-node FS trees.
+// Handles level-0 (single leaf node) AND level-1 (internal node
+// pointing to leaf blocks) FS trees. Depth ≥ 2 is uncommon on
+// cloud images at the per-directory level and is rejected (callers
+// move on to the next subvol candidate).
+//
+// Internal nodes carry btrfs_key_ptr entries — 33 bytes each:
+//
+//	0..17   btrfs_disk_key (objectid, type, offset)
+//	17..25  blockptr        (logical addr of child node)
+//	25..33  generation
+//
+// We collect every child's blockptr first (so the subsequent
+// per-child ReadBlocks call can safely re-use btrfsTreeBuf), then
+// load each child as a leaf and scan it.
+
+// childBlockPtrs is the package-scope scratch for the child block
+// pointers collected from a level-1 internal node. Cap is plenty
+// for cloud-image trees (typical fanout is hundreds, but the
+// directories we walk for /boot lookup only need a handful of
+// leaves at most).
+var (
+	childBlockPtrs [256]uint64
+	childPtrCount  int
+)
+
 func findInBtrfsDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
 	fsTreeLogical uint64, fsTreeLevel uint8, nodesize uint32,
 	parentDirInode uint64, prefix []byte,
 	outNameBuf *[255]byte, outNameLen *int,
 ) (uint64, bool) {
-	if fsTreeLevel != 0 {
-		writeASCII(co, "    FS_TREE level>0 not yet supported\r\n")
+	if fsTreeLevel > 1 {
+		// Multi-level descent (level ≥ 2) not implemented — would
+		// need iterative DFS with per-depth scratch buffers.
 		return 0, false
 	}
 	phys, ok := btrfsLogicalToPhys(fsTreeLogical)
@@ -1987,6 +2011,58 @@ func findInBtrfsDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkS
 		unsafe.Pointer(&btrfsTreeBuf[0])) {
 		return 0, false
 	}
+	actualLevel := btrfsTreeBuf[100]
+
+	if actualLevel == 0 {
+		return scanBtrfsLeafForDirPrefix(parentDirInode, prefix,
+			outNameBuf, outNameLen, nodesize)
+	}
+
+	// level == 1 — internal node. Collect every child bytenr first
+	// so the leaf reads below can safely re-use btrfsTreeBuf.
+	nritems := le32(btrfsTreeBuf[96:])
+	childPtrCount = 0
+	for i := uint32(0); i < nritems; i++ {
+		off := uint32(btrfsHeaderSize) + i*btrfsKeyPtrSize
+		if off+btrfsKeyPtrSize > nodesize {
+			break
+		}
+		if childPtrCount >= len(childBlockPtrs) {
+			break
+		}
+		childBlockPtrs[childPtrCount] = le64(btrfsTreeBuf[off+17:])
+		childPtrCount++
+	}
+	// Walk each child leaf, first match wins.
+	for j := 0; j < childPtrCount; j++ {
+		cphys, ok := btrfsLogicalToPhys(childBlockPtrs[j])
+		if !ok {
+			continue
+		}
+		if !readBtrfsBlock(bio, mediaId, devBlkSz, cphys, nodesize,
+			unsafe.Pointer(&btrfsTreeBuf[0])) {
+			continue
+		}
+		if btrfsTreeBuf[100] != 0 {
+			// Child is itself an internal node — depth ≥ 2.
+			continue
+		}
+		ino, found := scanBtrfsLeafForDirPrefix(parentDirInode, prefix,
+			outNameBuf, outNameLen, nodesize)
+		if found {
+			return ino, true
+		}
+	}
+	_ = co
+	return 0, false
+}
+
+// scanBtrfsLeafForDirPrefix scans an already-loaded leaf (in
+// btrfsTreeBuf) for the first DIR_INDEX_KEY or DIR_ITEM_KEY entry
+// under `parentDirInode` whose name starts with `prefix`.
+func scanBtrfsLeafForDirPrefix(parentDirInode uint64, prefix []byte,
+	outNameBuf *[255]byte, outNameLen *int, nodesize uint32,
+) (uint64, bool) {
 	nritems := le32(btrfsTreeBuf[96:])
 	for i := uint32(0); i < nritems; i++ {
 		off := uint32(btrfsHeaderSize) + i*btrfsItemSize
@@ -2000,10 +2076,6 @@ func findInBtrfsDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkS
 		if it.objectid != parentDirInode {
 			continue
 		}
-		// Accept both DIR_INDEX_KEY (0x61, sequential-index) and
-		// DIR_ITEM_KEY (0x60, name-hash-keyed) — both carry a
-		// btrfs_dir_item record. Some distros (openSUSE MicroOS)
-		// store FS_TREE dir entries only as DIR_ITEM_KEY.
 		if it.keyType != btrfsDirIndexKey && it.keyType != btrfsDirItemKey {
 			continue
 		}
@@ -2011,35 +2083,32 @@ func findInBtrfsDirPrefix(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkS
 		if dataPos+30 > nodesize {
 			break
 		}
-		// location is at dataPos+0; we want (objectid, type, offset)
 		locObjID := le64(btrfsTreeBuf[dataPos:])
-		// locType := btrfsTreeBuf[dataPos+8]
-		// locOff := le64(btrfsTreeBuf[dataPos+9:])
 		nameLen := le16(btrfsTreeBuf[dataPos+27:])
-		// ftype := btrfsTreeBuf[dataPos+29]
-		if uint32(nameLen) >= uint32(len(prefix)) &&
-			dataPos+30+uint32(nameLen) <= nodesize {
-			match := true
-			for j := 0; j < len(prefix); j++ {
-				if btrfsTreeBuf[dataPos+30+uint32(j)] != prefix[j] {
-					match = false
-					break
-				}
-			}
-			if match {
-				n := int(nameLen)
-				if n > len(outNameBuf) {
-					n = len(outNameBuf)
-				}
-				for j := 0; j < n; j++ {
-					outNameBuf[j] = btrfsTreeBuf[dataPos+30+uint32(j)]
-				}
-				*outNameLen = n
-				return locObjID, true
+		if uint32(nameLen) < uint32(len(prefix)) ||
+			dataPos+30+uint32(nameLen) > nodesize {
+			continue
+		}
+		match := true
+		for j := 0; j < len(prefix); j++ {
+			if btrfsTreeBuf[dataPos+30+uint32(j)] != prefix[j] {
+				match = false
+				break
 			}
 		}
+		if !match {
+			continue
+		}
+		n := int(nameLen)
+		if n > len(outNameBuf) {
+			n = len(outNameBuf)
+		}
+		for j := 0; j < n; j++ {
+			outNameBuf[j] = btrfsTreeBuf[dataPos+30+uint32(j)]
+		}
+		*outNameLen = n
+		return locObjID, true
 	}
-	_ = co
 	return 0, false
 }
 
