@@ -247,6 +247,43 @@ var (
 	}
 )
 
+// "CloudBootMark" — Apple-VZ diagnostic. The loader writes this
+// non-volatile EFI variable as its very first action; if the variable
+// appears in vfkit's variable-store file after the VM stops, we know
+// our BOOTAA64.EFI executed on Apple Virtualization.framework (where
+// SimpleTextOutput goes to the framebuffer only).
+var bootMarkVarName = [...]uint16{
+	'C', 'l', 'o', 'u', 'd', 'B', 'o', 'o', 't', 'M', 'a', 'r', 'k',
+	0,
+}
+var bootMarkVarData = [...]byte{'C', 'B', '-', 'R', 'A', 'N'}
+
+// bootMarkRT is the package-scope runtime services pointer + marker
+// helper so any cascade point can update CloudBootMark without
+// threading rt + co through every function. Set once in _start.
+var bootMarkRT *efiRuntimeServices
+
+func bootMark(tag string) {
+	if bootMarkRT == nil || bootMarkRT.setVariable == 0 {
+		return
+	}
+	if len(tag) > len(bootMarkVarData) {
+		tag = tag[:len(bootMarkVarData)]
+	}
+	for i := 0; i < len(bootMarkVarData); i++ {
+		bootMarkVarData[i] = ' '
+	}
+	for i := 0; i < len(tag); i++ {
+		bootMarkVarData[i] = tag[i]
+	}
+	efiCall5(bootMarkRT.setVariable,
+		uintptr(unsafe.Pointer(&bootMarkVarName[0])),
+		uintptr(unsafe.Pointer(&cloudBootGUID)),
+		uintptr(0x07),
+		uintptr(len(bootMarkVarData)),
+		uintptr(unsafe.Pointer(&bootMarkVarData[0])))
+}
+
 // "CloudBootCmdline" — UTF-16LE, NUL-terminated. Pre-encoded so we
 // don't allocate at runtime.
 var cmdlineVarName = [...]uint16{
@@ -782,6 +819,19 @@ func tryLoadFromHandle(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle
 	}
 	root := (*efiFile)(unsafe.Pointer(rootFileHolder))
 
+	// Step 2a: opportunistically read \cmdline from this volume BEFORE
+	// trying to open the UKI. Reading-before-UKI means the cmdline is
+	// still picked up when the UKI doesn't exist on the volume and we
+	// later fall through to the cloud-disk cascade. Only do this if
+	// readCmdlineEFIVar didn't already populate one — the EFI variable
+	// wins over disk files since the host can re-stage it without
+	// rebuilding the FAT image.
+	if cmdlineChars == 0 {
+		if readCmdline(co, bs, root) {
+			writeASCII(co, "cmdline source: \\cmdline file\r\n")
+		}
+	}
+
 	// Step 3: Open the kernel image. Mode = READ, no attributes.
 	kernelFileHolder = 0
 	st = efiCall5(root.open,
@@ -797,16 +847,6 @@ func tryLoadFromHandle(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle
 		return false
 	}
 	kf := (*efiFile)(unsafe.Pointer(kernelFileHolder))
-
-	// Step 3a: opportunistically read \cmdline from the same volume —
-	// but ONLY if readCmdlineEFIVar didn't already populate one. The
-	// EFI variable wins over the disk file because the host can
-	// re-stage it without rebuilding the FAT image.
-	if cmdlineChars == 0 {
-		if readCmdline(co, bs, root) {
-			writeASCII(co, "cmdline source: \\cmdline file\r\n")
-		}
-	}
 	// Now done with root.
 	efiCall1(root.close, rootFileHolder)
 
@@ -917,6 +957,14 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	co := st.conOut
 	bs := st.bootServices
 	rt := st.runtimeServices
+
+	// Apple-VZ diagnostic: SimpleTextOutput on Apple's UEFI under
+	// vfkit goes to framebuffer only — there's no serial pipe to
+	// macOS hosting. Stamp a non-volatile EFI variable as the very
+	// first action so the host can detect via vfkit's varstore file
+	// that the loader executed at all.
+	bootMarkRT = rt
+	bootMark("CB-RAN")
 
 	writeASCII(co, "cloud-boot/loader — phase 5b/5c/5d\r\n")
 

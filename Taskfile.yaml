@@ -520,6 +520,65 @@ tasks:
         -drive if=virtio,format=qcow2,file=cloud-overlay.qcow2,id=cloud
         -nographic -serial mon:stdio
 
+  # vfkit-loader-cloud-arm64: production loader on real Apple
+  # Virtualization.framework via vfkit (Red Hat / crc-org). Same
+  # ext4 cloud-disk fallback as qemu-loader-cloud-arm64, but
+  # exercised under Apple's UEFI implementation instead of OVMF —
+  # which is the entire reason the loader exists (kexec_file_load
+  # is trapped under VZ).
+  #
+  # Apple's UEFI routes SimpleTextOutput to the framebuffer only,
+  # so we can't see the loader's writeASCII traffic. Instead we
+  # rely on:
+  #   1. CloudBootMark non-volatile EFI variable (set as the very
+  #      first thing in _start), inspectable in the resulting
+  #      efi-vars.fd after the VM stops.
+  #   2. Linux kernel writing to virtio-serial once started (the
+  #      \cmdline file embedded in the modified ESP carries
+  #      console=hvc0).
+  #
+  # The Debian image is mutated in-place: ESP partition extracted,
+  # our BOOTAA64.EFI overlaid at \EFI\BOOT\BOOTAA64.EFI alongside
+  # a \cmdline file, then written back. After the run inspect
+  # /tmp/vz-test/vfkit/serial-mod.log for kernel output and
+  # /tmp/vz-test/vfkit/efi-vars-mod.fd for the marker variable.
+  vfkit-loader-cloud-arm64:
+    desc: Boot the production loader on real Apple Virtualization.framework via vfkit.
+    deps: [loader-arm64]
+    dir: cmd/efi-loader
+    preconditions:
+      - sh: 'test -f "{{.DEBIAN_RAW}}"'
+        msg: 'Debian cloud image missing — fetch it first with `ARCH=arm64 task -t ../../uki/Taskfile.yaml label:debian:cloud`.'
+      - sh: 'which vfkit > /dev/null'
+        msg: 'vfkit not installed — run `brew install vfkit` first.'
+    vars:
+      CMDLINE: '{{.CMDLINE | default "console=hvc0 root=LABEL=cloudimg-rootfs ro"}}'
+      VZTEST:  /tmp/vz-test
+    cmds:
+      - mkdir -p {{.VZTEST}}/vfkit
+      # Copy the raw Debian cloud image into a writable working copy.
+      - cp {{.DEBIAN_RAW}} {{.VZTEST}}/debian.raw
+      # Extract the ESP (GPT partition 15 on Debian arm64
+      # genericcloud: starts at LBA 2048, runs 260096 sectors =
+      # 127 MiB), overlay our loader + cmdline, write back.
+      - dd if={{.VZTEST}}/debian.raw of={{.VZTEST}}/esp.img bs=512 skip=2048 count=260096 status=none
+      - mcopy -o -i {{.VZTEST}}/esp.img {{.LOADER_ARM64_OUT}} ::EFI/BOOT/BOOTAA64.EFI
+      - echo -n "{{.CMDLINE}}" > {{.VZTEST}}/cmdline.txt
+      - mcopy -o -i {{.VZTEST}}/esp.img {{.VZTEST}}/cmdline.txt ::cmdline
+      - dd if={{.VZTEST}}/esp.img of={{.VZTEST}}/debian.raw bs=512 seek=2048 count=260096 conv=notrunc status=none
+      # Fresh varstore on every run — the previous run's
+      # CloudBootMark variable would otherwise persist and obscure
+      # what THIS run did.
+      - rm -f {{.VZTEST}}/vfkit/efi-vars.fd {{.VZTEST}}/vfkit/serial.log
+      - >-
+        vfkit --cpus 2 --memory 2048
+        --bootloader efi,variable-store={{.VZTEST}}/vfkit/efi-vars.fd,create
+        --device virtio-blk,path={{.VZTEST}}/debian.raw
+        --device virtio-serial,logFilePath={{.VZTEST}}/vfkit/serial.log
+        --device virtio-rng
+        --device virtio-net,nat,mac=72:20:43:d4:38:01
+        --gui
+
   clean:
     cmds:
       - rm -f cmd/efi-probe/*.o cmd/efi-probe/*.EFI cmd/efi-probe/esp.img cmd/efi-probe/ovmf_vars_arm64.fd
