@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/cloud-boot/brand/main/social/cloud-boot.png" alt="cloud-boot/loader" width="720"></p>
+
 # cloud-boot/loader
 
 Pure-UEFI variant of cloud-boot — a TinyGo PE/COFF UEFI application
@@ -19,8 +21,112 @@ original target since Apple VZ traps `kexec_file_load` on arm64).
 | AlmaLinux 9 / RHEL family | xfs /boot + xfs / | ✓ systemd target | ✓ login prompt + shutdown |
 | openSUSE Leap Micro 6.2 | btrfs (default-subvol snapshot) | ✓ JeOS Firstboot | ✓ JeOS Firstboot + shutdown |
 | Alpine Linux 3.21 | ext4 rootfs (AWS variant) | ✓ cloud-init started | ✓ cloud-init started |
+| **FreeBSD 14.3** | UFS2 / + ESP at `\EFI\BOOT\bootaa64.efi` | ✓ login prompt reached (FreeBSD 14.3-RELEASE GENERIC arm64) | ☐ pending |
+| **OpenBSD 7.x** | FFS / + ESP at `\EFI\BOOT\bootaa64.efi` | ☐ code in tree; no official arm64 cloud image to test against | ☐ |
+| **NetBSD 10.0** | FFS rootfs + ESP at `\EFI\BOOT\bootaa64.efi` | ✓ login prompt reached (`NetBSD 10.0 (GENERIC64)`, `dk1 at ld5: "netbsd-root"`, `NetBSD/evbarm (arm64) (constty) login:`) | ☐ pending |
 
 amd64 cross-compiles clean (BOOTX64.EFI), untested in this round.
+
+## FreeBSD via `CloudBootTarget=freebsd`
+
+`CloudBootTarget=freebsd` routes the FAT-ESP lookup to FreeBSD's
+own bootloader at `\EFI\freebsd\loader.efi` (the path the FreeBSD
+installer + cloud-image builder write to), instead of the Linux
+UKI path `\EFI\Linux\<target>.efi`. Same `LoadImage` + `StartImage`
+firmware handoff; from there FreeBSD's `loader` takes over and
+reads `/boot/loader` from the disk's UFS2 or ZFS rootfs — that's
+the BSD bootloader's job, not ours, so we don't need to add a
+UFS2/ZFS reader to the loader binary itself.
+
+Sidestepped along the way: the Linux-EFI-initrd protocol
+(`LINUX_EFI_INITRD_MEDIA_GUID`) — FreeBSD doesn't use it.
+`patchChildCmdline` is still safe to run because FreeBSD's loader
+ignores `LoadOptions` it doesn't understand; a future refinement
+could skip it for BSD targets.
+
+### Verified handoff (FreeBSD 14.3 arm64 cloud image, QEMU)
+
+```text
+  our DeviceHandle captured
+  trying UKI \EFI\freebsd\loader.efi
+  skipping self device handle
+  freebsd: vendor path missed, trying fallback \EFI\BOOT\bootaa64.efi
+  trying UKI \EFI\BOOT\bootaa64.efi
+  skipping self device handle
+  found UKI, size = 0x00000000000D071C
+  LoadImage OK
+StartImage...
+    Reading loader env vars from /efi/freebsd/loader.env
+FreeBSD/arm64 EFI loader, Revision 3.0
+```
+
+Three implementation details made this work:
+
+  1. **Self-skip in tryAllHandles** — FreeBSD's cloud images install
+     their bootloader at the EFI removable-media fallback path
+     `\EFI\BOOT\bootaa64.efi`, the *same* path that holds OUR own
+     `BOOTAA64.EFI` on the cloud-boot ESP. Without a self-handle
+     skip, the cascade would re-`LoadImage` ourselves in an
+     infinite loop. We capture our own `DeviceHandle` via
+     `LoadedImageProtocol` on the parent `imageHandle` at the top
+     of `_start` and `tryAllHandles` drops it from the iteration.
+
+  2. **Two-path FreeBSD cascade** — `\EFI\freebsd\loader.efi`
+     (`bsdinstall` convention on metal installs) is tried first,
+     then `\EFI\BOOT\bootaa64.efi` (cloud-image convention). The
+     two-step lookup means the same `CloudBootTarget=freebsd`
+     handles both deployment shapes without any host-side staging.
+
+  3. **`LoadImage(DevicePath)` for the FreeBSD branch** — instead
+     of the Linux branch's `LoadImage(SourceBuffer)` (we read the
+     file into a pool buffer and pass the bytes), the FreeBSD
+     branch builds a composite `EFI_DEVICE_PATH` of the form
+     `<volume DP nodes> ‖ FILEPATH(ukiPath) ‖ END` and passes that
+     to `LoadImage` with `SourceBuffer = NULL`. The firmware
+     reopens the file via SimpleFileSystem on the named volume
+     and — critically — sets the chained image's
+     `LoadedImage.FilePath` to that DevicePath. FreeBSD's
+     `loader.efi` introspects its own `FilePath` to deduce
+     `currdev` (the device its boot modules live on); without
+     this, the BSD loader walks `disk0:` then `net0:` blindly and
+     can stall. Linux's EFI stub doesn't care, so the Linux six-
+     distro path stays on `SourceBuffer` — same code as before.
+
+## OpenBSD / NetBSD via `CloudBootTarget=openbsd` / `=netbsd`
+
+Both use the EFI removable-media path `\EFI\BOOT\bootaa64.efi`
+(no vendor subdir convention), so `buildUKIPath()` routes them
+straight there without the FreeBSD two-step cascade. The BSD
+gate in `tryLoadFromHandle` is `isBSDTarget()` — `freebsd ||
+openbsd || netbsd` — so all three reach the same
+`LoadImage(DevicePath, SourceBuffer=NULL)` code path that gives
+the chained BSD loader a populated `LoadedImage.FilePath`.
+
+### Verified handoff (NetBSD 10.0 arm64, QEMU)
+
+```text
+  target from EFI var CloudBootTarget: netbsd
+  trying UKI \EFI\BOOT\bootaa64.efi
+  skipping self device handle
+  LoadImage(DevicePath) OK, child handle = 0x00000000BF02C398
+StartImage...
+   \\        __,---`  NetBSD/evbarm efiboot (arm64)
+booting netbsd - starting in 5 seconds. 4 … 3 … 2 … 1 … 0
+[   1.0000000] NetBSD 10.0 (GENERIC64) #0: Thu Mar 28 08:33:33 UTC 2024
+[   1.0000040] dk1 at ld5: "netbsd-root", 2891776 blocks at 196608, type: ffs
+NetBSD/evbarm (arm64) (constty)
+login:
+```
+
+### OpenBSD status
+
+The OpenBSD project does not publish ready-to-boot arm64 cloud
+images (only installer media that require an interactive install
+session before booting a real system). The routing code is in
+the tree and unit-tested — `CloudBootTarget=openbsd` builds
+`\EFI\BOOT\bootaa64.efi` and goes through the same `isBSDTarget()`
+LoadImage(DevicePath) path NetBSD uses — but no E2E run was
+possible from inside this session.
 
 Each filesystem driver (ext4, xfs, btrfs) sits in its own file under
 `cmd/efi-loader/`; the cascade in [`main.go`](cmd/efi-loader/main.go)

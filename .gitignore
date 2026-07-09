@@ -25,3 +25,6 @@ cloud-overlay.qcow2
 
 # Taskfile run-state.
 .task/
+/.freebsd-cache/
+/.netbsd-cache/
+*.qcow2

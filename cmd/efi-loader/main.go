@@ -230,6 +230,9 @@ var (
 		0xD2, 0x11,
 		0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B,
 	}
+	// devicePathGUID is declared in ext4.go (already used by the
+	// ext4 walker for HandleProtocol on BlockIO handles). Reused here
+	// for buildFilePath() — see its definition + comment in ext4.go.
 
 	// cloud-boot vendor GUID — namespace for cloud-boot-specific UEFI
 	// variables ("CloudBootCmdline", future "CloudBootTarget", …).
@@ -419,6 +422,36 @@ var (
 	targetRawLen  uintptr
 	defaultTarget = [...]byte{'c', 'l', 'o', 'u', 'd', '-', 'b', 'o', 'o', 't'}
 
+	// ourDeviceHandle is the DeviceHandle of the SimpleFileSystem we
+	// were loaded from (extracted from LoadedImageProtocol on our own
+	// imageHandle at the start of _start). tryAllHandles skips it
+	// when iterating SFS handles, so we never LoadImage ourselves —
+	// which would happen on the FreeBSD-cloud-image fallback path
+	// `\EFI\BOOT\bootaa64.efi`, since OUR loader is also exposed at
+	// that exact path on the boot ESP. Zero is "not yet captured —
+	// the skip is a no-op", matching the LoadImage-from-anywhere
+	// default behaviour.
+	//
+	// selfLIPHolder is the OUT-parameter slot for the HandleProtocol
+	// call. Kept as a package global (not a local in _start) to
+	// match the no-escape-to-heap convention TinyGo+UEFI requires
+	// — see memory:tinygo-uefi-landmines; locals taken by `&` and
+	// passed across function boundaries get heap-allocated, which
+	// has no backing allocator in our runtime and crashes silently.
+	ourDeviceHandle uintptr
+	selfLIPHolder   uintptr
+
+	// volDPHolder is the OUT slot for HandleProtocol(DEVICE_PATH).
+	// fileDPBuf holds the composite DevicePath we build for LoadImage:
+	// the volume's device path (copied byte-for-byte from the firmware's
+	// instance) followed by a FilePath node naming the file on that
+	// volume, terminated by the standard END node. 4 KiB is enormous
+	// vs the typical 32–128-byte real-world device paths but keeps us
+	// safe for deeply-nested PCI/USB/SAS chains we might one day see.
+	volDPHolder uintptr
+	fileDPBuf   [4096]byte
+	fileDPLen   uintptr
+
 	// Cmdline source path. ASCII bytes, one line, trailing newline
 	// tolerated. "\cmdline" at the FAT root — same convention
 	// systemd-boot's loader.conf uses, with the simplification of
@@ -460,6 +493,41 @@ var (
 	ext4DirectTag  = [...]byte{'e', 'x', 't', '4', '-', 'd', 'i', 'r', 'e', 'c', 't'}
 	xfsDirectTag   = [...]byte{'x', 'f', 's', '-', 'd', 'i', 'r', 'e', 'c', 't'}
 	btrfsDirectTag = [...]byte{'b', 't', 'r', 'f', 's', '-', 'd', 'i', 'r', 'e', 'c', 't'}
+
+	// Cross-OS target tags.
+	//
+	// CloudBootTarget=freebsd routes the FAT-ESP lookup to FreeBSD's
+	// native bootloader path (`\EFI\freebsd\loader.efi`, placed there
+	// by `bsdinstall` on metal installs) with a fallback cascade to
+	// the EFI removable-media path `\EFI\BOOT\bootaa64.efi` used by
+	// FreeBSD's cloud-image builder. Same LoadImage+StartImage
+	// handoff; the BSD loader then reads /boot/loader from the disk's
+	// UFS2 or ZFS rootfs (no Linux-side initrd plumbing required —
+	// BSD doesn't use the Linux EFI initrd protocol).
+	//
+	// CloudBootTarget=openbsd and CloudBootTarget=netbsd both route
+	// straight to `\EFI\BOOT\bootaa64.efi`: neither OS uses a vendor
+	// subdir convention; their cloud images and installers always
+	// post the bootloader at the standard EFI removable-media
+	// fallback path. The self-handle skip in tryAllHandles is
+	// essential here — our own BOOTAA64.EFI sits at the same path on
+	// the cloud-boot ESP, and without the skip we would LoadImage
+	// ourselves in an infinite loop.
+	freebsdTag = [...]byte{'f', 'r', 'e', 'e', 'b', 's', 'd'}
+	openbsdTag = [...]byte{'o', 'p', 'e', 'n', 'b', 's', 'd'}
+	netbsdTag  = [...]byte{'n', 'e', 't', 'b', 's', 'd'}
+
+	// CloudBootTarget=windows routes to the Windows Boot Manager at
+	// \EFI\Microsoft\Boot\bootmgfw.efi (placed there by the Windows
+	// installer / Setup.exe). Same FilePath-handoff mechanism as the
+	// BSD branch: the Boot Manager introspects its own
+	// LoadedImage.FilePath to find the boot volume's NTFS partition,
+	// so LoadImage(DevicePath, SourceBuffer=NULL) is mandatory. The
+	// _start cascade retries with the EFI removable-media fallback
+	// path (\EFI\BOOT\BOOTAA64.EFI on arm64, BOOTX64.EFI on amd64)
+	// when the vendor path misses — that's where Windows-To-Go and
+	// some recovery sticks install the binary.
+	windowsTag = [...]byte{'w', 'i', 'n', 'd', 'o', 'w', 's'}
 )
 
 // bytesMatchTarget returns true if `tag` equals the CloudBootTarget
@@ -521,7 +589,105 @@ func readTargetEFIVar(co *efiSimpleTextOutput, rt *efiRuntimeServices) bool {
 // buildUKIPath constructs the UTF-16LE path "\EFI\Linux\<target>.efi"
 // in `ukiPath`, NUL-terminated. If targetRawLen is zero, "cloud-boot"
 // is used as the target name (Phase-5a default).
+// isBSDTarget reports whether the resolved CloudBootTarget names one
+// of the three BSD families this loader knows about. The BSD branch
+// in tryLoadFromHandle uses this gate to switch to LoadImage with a
+// DevicePath (the Linux six-distro matrix stays on the original
+// SourceBuffer path — that one was hard-won and we don't want to
+// disturb it).
+func isBSDTarget() bool {
+	return bytesMatchTarget(freebsdTag[:]) ||
+		bytesMatchTarget(openbsdTag[:]) ||
+		bytesMatchTarget(netbsdTag[:])
+}
+
+// isWindowsTarget reports whether the resolved CloudBootTarget names
+// Windows. Windows Boot Manager has the same FilePath introspection
+// requirement as BSD loaders, so it shares the BSD branch's
+// LoadImage(DevicePath, SourceBuffer=NULL) code path.
+func isWindowsTarget() bool {
+	return bytesMatchTarget(windowsTag[:])
+}
+
+// wantsFilePathHandoff is the semantic gate for the
+// LoadImage(DevicePath) branch — true when the chained image
+// introspects its own LoadedImage.FilePath to find its boot
+// volume (BSD bootloaders, Windows Boot Manager). The Linux EFI
+// stub doesn't introspect, so Linux UKIs stay on the
+// SourceBuffer path.
+func wantsFilePathHandoff() bool {
+	return isBSDTarget() || isWindowsTarget()
+}
+
+// setBSDFallbackPath rewrites ukiPath to the EFI removable-media
+// fallback path \EFI\BOOT\bootaa64.efi — where FreeBSD cloud images
+// (and OpenBSD/NetBSD images, by removable-media convention) install
+// their bootloader. Called:
+//
+//  - By the FreeBSD cascade in _start after the vendor path
+//    \EFI\freebsd\loader.efi misses on all SFS handles.
+//  - Directly by buildUKIPath() for openbsd/netbsd targets (those
+//    have no vendor-subdir variant to try first).
+//
+// Same no-heap pattern as buildUKIPath; arch-agnostic because the
+// filename matches what arm64 firmware looks for at this path.
+func setBSDFallbackPath() {
+	const p = "\\EFI\\BOOT\\bootaa64.efi"
+	off := 0
+	for i := 0; i < len(p); i++ {
+		ukiPath[off] = uint16(p[i])
+		off++
+	}
+	ukiPath[off] = 0
+}
+
 func buildUKIPath() {
+	// Cross-OS shortcut: CloudBootTarget=freebsd routes to FreeBSD's
+	// native EFI bootloader at \EFI\freebsd\loader.efi on the disk's
+	// FAT ESP. This is the path FreeBSD's bsdinstall + cloud-image
+	// builder write to; it boots whether the rootfs is UFS2 or ZFS,
+	// because the BSD loader is the one that knows how to read those
+	// — our loader just does the firmware-mediated LoadImage handoff,
+	// same as it does for Linux UKIs. When this vendor path misses,
+	// the _start cascade retries with setBSDFallbackPath().
+	if bytesMatchTarget(freebsdTag[:]) {
+		const bsdPath = "\\EFI\\freebsd\\loader.efi"
+		off := 0
+		for i := 0; i < len(bsdPath); i++ {
+			ukiPath[off] = uint16(bsdPath[i])
+			off++
+		}
+		ukiPath[off] = 0
+		return
+	}
+
+	// CloudBootTarget=openbsd / =netbsd: both go straight to the EFI
+	// removable-media fallback path \EFI\BOOT\bootaa64.efi. Unlike
+	// FreeBSD, neither uses a vendor subdir convention — `installboot`
+	// (OpenBSD) and the NetBSD installer always post the loader at
+	// the standard fallback path. No retry cascade needed.
+	if bytesMatchTarget(openbsdTag[:]) || bytesMatchTarget(netbsdTag[:]) {
+		setBSDFallbackPath()
+		return
+	}
+
+	// CloudBootTarget=windows: try the vendor Windows Boot Manager
+	// path first (\EFI\Microsoft\Boot\bootmgfw.efi — where Setup.exe
+	// installs it on every supported edition). If the vendor path
+	// misses, the _start cascade retries with setBSDFallbackPath()
+	// (covers Windows-To-Go sticks + recovery media that put the
+	// binary at \EFI\BOOT\BOOT<arch>.EFI).
+	if bytesMatchTarget(windowsTag[:]) {
+		const winPath = "\\EFI\\Microsoft\\Boot\\bootmgfw.efi"
+		off := 0
+		for i := 0; i < len(winPath); i++ {
+			ukiPath[off] = uint16(winPath[i])
+			off++
+		}
+		ukiPath[off] = 0
+		return
+	}
+
 	const prefix = "\\EFI\\Linux\\"
 	const suffix = ".efi"
 
@@ -782,6 +948,104 @@ func patchChildCmdline(co *efiSimpleTextOutput, bs *efiBootServices, childHandle
 	writeASCII(co, " bytes)\r\n")
 }
 
+// buildFilePath constructs a composite DevicePath in fileDPBuf:
+//
+//	[ volume DP nodes... ] [ FILEPATH node(ukiPath) ] [ END node ]
+//
+// It does so by:
+//
+//  1. HandleProtocol(sfsHandle, EFI_DEVICE_PATH_PROTOCOL_GUID) — gives
+//     the firmware's instance of the volume's device path.
+//  2. Walk that instance node-by-node (each node header is type:1 |
+//     subtype:1 | length:2-LE) until we hit the END marker
+//     (type=0x7F, subtype=0xFF). Copy every byte EXCLUDING the END
+//     marker into fileDPBuf.
+//  3. Append a MEDIA_DEVICE_PATH/FILEPATH_DP node (type=0x04,
+//     subtype=0x04). Payload is the UTF-16LE path string INCLUDING
+//     the terminating NUL — matching EFI spec section 9.3.6.4.
+//  4. Append the END marker.
+//
+// Returns true on success; populates fileDPLen with the total length.
+// On failure (HandleProtocol or buffer overflow) the buffer is left
+// untouched and the caller falls back.
+//
+// The "globals-only" convention is intentional: every intermediate
+// slot (volDPHolder, fileDPBuf, fileDPLen) is package-level so
+// TinyGo doesn't heap-allocate them. See [[tinygo-uefi-landmines]].
+func buildFilePath(co *efiSimpleTextOutput, bs *efiBootServices, sfsHandle uintptr) bool {
+	volDPHolder = 0
+	st := efiCall3(bs.handleProtocol,
+		sfsHandle,
+		uintptr(unsafe.Pointer(&devicePathGUID)),
+		uintptr(unsafe.Pointer(&volDPHolder)))
+	if st != efiSuccess || volDPHolder == 0 {
+		writeASCII(co, "  HandleProtocol(DevicePath) failed\r\n")
+		return false
+	}
+
+	// Walk the volume DP, copying nodes until we see END.
+	var off uintptr = 0
+	src := volDPHolder
+	for {
+		// header = type(1) subtype(1) length(2 LE)
+		nodeType := *(*byte)(unsafe.Pointer(src))
+		// subtype not used here but read for symmetry / future logging
+		nodeLen := uint32(*(*byte)(unsafe.Pointer(src + 2))) |
+			uint32(*(*byte)(unsafe.Pointer(src + 3)))<<8
+		if nodeLen < 4 || nodeLen > 1024 {
+			writeASCII(co, "  DP node length out of range\r\n")
+			return false
+		}
+		if nodeType == 0x7F {
+			// END marker — stop, do not copy it; we'll append our own.
+			break
+		}
+		if off+uintptr(nodeLen) >= uintptr(len(fileDPBuf))-256 {
+			writeASCII(co, "  DP buffer overflow while walking volume nodes\r\n")
+			return false
+		}
+		for i := uintptr(0); i < uintptr(nodeLen); i++ {
+			fileDPBuf[off+i] = *(*byte)(unsafe.Pointer(src + i))
+		}
+		off += uintptr(nodeLen)
+		src += uintptr(nodeLen)
+	}
+
+	// Append FILEPATH node header: type=0x04 (MEDIA), subtype=0x04
+	// (FILEPATH_DP), length = 4 + UTF-16-bytes-including-NUL.
+	var pathChars uintptr = 0
+	for pathChars < uintptr(len(ukiPath)) && ukiPath[pathChars] != 0 {
+		pathChars++
+	}
+	payloadBytes := (pathChars + 1) * 2 // include the trailing NUL
+	nodeLen := 4 + payloadBytes
+	if off+nodeLen+4 >= uintptr(len(fileDPBuf)) {
+		writeASCII(co, "  DP buffer overflow on FILEPATH node\r\n")
+		return false
+	}
+	fileDPBuf[off+0] = 0x04
+	fileDPBuf[off+1] = 0x04
+	fileDPBuf[off+2] = byte(nodeLen & 0xFF)
+	fileDPBuf[off+3] = byte((nodeLen >> 8) & 0xFF)
+	// UTF-16LE payload — ukiPath is already []uint16.
+	for i := uintptr(0); i < pathChars+1; i++ {
+		w := ukiPath[i]
+		fileDPBuf[off+4+i*2] = byte(w & 0xFF)
+		fileDPBuf[off+4+i*2+1] = byte((w >> 8) & 0xFF)
+	}
+	off += nodeLen
+
+	// END node: type=0x7F, subtype=0xFF, length=4.
+	fileDPBuf[off+0] = 0x7F
+	fileDPBuf[off+1] = 0xFF
+	fileDPBuf[off+2] = 0x04
+	fileDPBuf[off+3] = 0x00
+	off += 4
+
+	fileDPLen = off
+	return true
+}
+
 // tryAllHandles walks every SimpleFileSystem handle in sfsHandleBuf
 // and tries to load the UKI currently encoded in ukiPath from each
 // one. Returns true on the first successful LoadImage. The caller is
@@ -796,6 +1060,16 @@ func tryAllHandles(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle uin
 	writeASCII(co, "\r\n")
 	for i := uintptr(0); i < sfsHandleCount; i++ {
 		h := *(*uintptr)(unsafe.Pointer(sfsHandleBuf + i*unsafe.Sizeof(uintptr(0))))
+		// Skip our own backing device: it carries OUR BOOTAA64.EFI at
+		// \EFI\BOOT\BOOTAA64.EFI, and the FreeBSD-cloud cascade below
+		// would happily LoadImage that path → infinite loop. The skip
+		// is a no-op for any path that doesn't collide (the Linux UKI
+		// path \EFI\Linux\<target>.efi never lives on our ESP because
+		// we never write there).
+		if ourDeviceHandle != 0 && h == ourDeviceHandle {
+			writeASCII(co, "  skipping self device handle\r\n")
+			continue
+		}
 		if tryLoadFromHandle(co, bs, imageHandle, h) {
 			return true
 		}
@@ -860,6 +1134,43 @@ func tryLoadFromHandle(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle
 	kf := (*efiFile)(unsafe.Pointer(kernelFileHolder))
 	// Now done with root.
 	efiCall1(root.close, rootFileHolder)
+
+	// BSD branch: when the target is freebsd, openbsd, or netbsd we
+	// LoadImage via DevicePath rather than SourceBuffer. The reason
+	// is BSD bootloaders read their own LoadedImage.FilePath to
+	// deduce `currdev` (the device their boot modules sit on). With
+	// a NULL FilePath (SourceBuffer mode) the BSD loader walks
+	// disk0/net0 blindly and may stall; with a real FilePath
+	// pointing at the volume it opens the right partition straight
+	// away. The Linux EFI stub doesn't care, but we keep the manual
+	// read+LoadImage path for it below to avoid disturbing the six-
+	// distro matrix that was already verified end-to-end.
+	if wantsFilePathHandoff() {
+		// We just used `kf` as an existence-check; close it and let
+		// LoadImage re-open the file via the firmware's own SFS.
+		efiCall1(kf.close, kernelFileHolder)
+		if !buildFilePath(co, bs, sfsHandle) {
+			return false
+		}
+		childImageHandle = 0
+		st = efiCall6(bs.loadImage,
+			0,                                          // BootPolicy=FALSE
+			imageHandle,                                // ParentImageHandle
+			uintptr(unsafe.Pointer(&fileDPBuf[0])),     // DevicePath = our composite
+			0,                                          // SourceBuffer = NULL
+			0,                                          // SourceSize = 0
+			uintptr(unsafe.Pointer(&childImageHandle))) // OUT: ImageHandle
+		if st != efiSuccess {
+			writeASCII(co, "  LoadImage(DevicePath) failed: ")
+			writeHex64(co, st)
+			writeASCII(co, "\r\n")
+			return false
+		}
+		writeASCII(co, "  LoadImage(DevicePath) OK, child handle = ")
+		writeHex64(co, uint64(childImageHandle))
+		writeASCII(co, "\r\n")
+		return true
+	}
 
 	// Step 4: find the file size via SetPosition(END) → GetPosition.
 	st = efiCall2(kf.setPosition, kernelFileHolder, uintptr(efiFilePositionEnd))
@@ -976,6 +1287,30 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 	// that the loader executed at all.
 	bootMarkRT = rt
 	bootMark("CB-RAN")
+
+	// Capture our own DeviceHandle so tryAllHandles can skip it.
+	// Needed because the FreeBSD cloud-image cascade tries the
+	// fallback path \EFI\BOOT\bootaa64.efi, which is also where OUR
+	// loader sits on the boot ESP — without the skip we would
+	// happily LoadImage ourselves in an infinite loop. Failure here
+	// is non-fatal (zero stays in ourDeviceHandle, the skip becomes
+	// a no-op, which only matters in the BSD-fallback case).
+	//
+	// `selfLIPHolder` is a package global (see [[tinygo-uefi-landmines]]):
+	// a local `&liPtr` would be heap-allocated by TinyGo's escape
+	// analysis, and we have no allocator in this UEFI runtime — the
+	// existing patchChildCmdline uses the same global-slot pattern.
+	selfLIPHolder = 0
+	if stHP := efiCall3(bs.handleProtocol,
+		imageHandle,
+		uintptr(unsafe.Pointer(&loadedImageGUID)),
+		uintptr(unsafe.Pointer(&selfLIPHolder))); stHP == efiSuccess && selfLIPHolder != 0 {
+		li := (*efiLoadedImageProtocol)(unsafe.Pointer(selfLIPHolder))
+		ourDeviceHandle = li.deviceHandle
+		writeASCII(co, "  our DeviceHandle captured\r\n")
+	} else {
+		writeASCII(co, "  LoadedImage HandleProtocol failed (self-skip disabled)\r\n")
+	}
 
 	// Phase-A passive probe: bring the EFI_SIMPLE_NETWORK interface
 	// up (LocateHandleBuffer → HandleProtocol → Start → Initialize
@@ -1107,6 +1442,32 @@ func _start(imageHandle uintptr, st *efiSystemTable) efiStatus {
 			writeASCII(co, "\r\n")
 			// Step 2: try each volume for the resolved target.
 			loaded = tryAllHandles(co, bs, imageHandle)
+
+			// FreeBSD cascade: cloud images install the loader at the
+			// removable-media fallback path \EFI\BOOT\bootaa64.efi
+			// (not at \EFI\freebsd\loader.efi like bsdinstall does on
+			// metal). If the vendor path missed, retry the fallback
+			// path — tryAllHandles' self-handle skip prevents the
+			// obvious infinite loop (our own BOOTAA64.EFI sits at the
+			// same path on the boot ESP).
+			if !loaded && bytesMatchTarget(freebsdTag[:]) {
+				writeASCII(co, "  freebsd: vendor path missed, trying fallback \\EFI\\BOOT\\bootaa64.efi\r\n")
+				setBSDFallbackPath()
+				loaded = tryAllHandles(co, bs, imageHandle)
+			}
+
+			// Windows cascade: same shape as the FreeBSD one above.
+			// When \EFI\Microsoft\Boot\bootmgfw.efi misses (no Windows
+			// install on this disk), retry the EFI removable-media
+			// fallback path so Windows-To-Go / recovery media still
+			// boot. Self-handle skip in tryAllHandles prevents the
+			// loopback against our own BOOT<arch>.EFI.
+			if !loaded && bytesMatchTarget(windowsTag[:]) {
+				writeASCII(co, "  windows: vendor path missed, trying fallback \\EFI\\BOOT\\boot<arch>.efi\r\n")
+				setBSDFallbackPath()
+				loaded = tryAllHandles(co, bs, imageHandle)
+			}
+
 			if !loaded && targetRawLen > 0 {
 				writeASCII(co, "  target UKI not found, falling back to cloud-boot.efi\r\n")
 				targetRawLen = 0
