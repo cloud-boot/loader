@@ -118,11 +118,11 @@ func wrb(base uintptr, off uint64, v byte) {
 // package-scope state (so no stack-locals escape into heap allocs).
 
 var (
-	brBase   uintptr
-	brLen    uint64
+	brBase    uintptr
+	brLen     uint64
 	brBytePos uint64
-	brBuf    uint32 // accumulator
-	brNbits  uint32 // valid bits in brBuf
+	brBuf     uint32 // accumulator
+	brNbits   uint32 // valid bits in brBuf
 )
 
 func brInit(base uintptr, length uint64, startByte uint64) {
@@ -225,7 +225,8 @@ type huffTable struct {
 // hLit is the literal/length tree (max 288 symbols).
 // hDist is the distance tree (max 30 symbols).
 // hCL is the code-length tree (max 19 symbols), used to decode the
-//      dynamic-tree spec at the start of a BTYPE=10 block.
+//
+//	dynamic-tree spec at the start of a BTYPE=10 block.
 var hLit, hDist, hCL huffTable
 
 // huffBuildOffsets is shared scratch for buildHuffman — taking the

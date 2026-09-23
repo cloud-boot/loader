@@ -40,26 +40,26 @@ var pciIOGUID = efiGUID{
 // declare the function pointers we use; the rest are typed as raw
 // uintptrs at the right offsets so the slot layout stays correct.
 type efiPCIIO struct {
-	pollMem            uintptr
-	pollIO             uintptr
-	memRead            uintptr
-	memWrite           uintptr
-	ioRead             uintptr
-	ioWrite            uintptr
-	configRead         uintptr // (THIS, Width, Offset UINT32, Count UINTN, Buffer *VOID) → STATUS
-	configWrite        uintptr
-	copyMem            uintptr
-	mapDMA             uintptr
-	unmapDMA           uintptr
-	allocateBuffer     uintptr // (THIS, Type, MemoryType, Pages UINTN, *HostAddress **VOID, Attributes UINT64) → STATUS
-	freeBuffer         uintptr
-	flush              uintptr
-	getLocation        uintptr // (THIS, *Segment UINTN, *Bus UINTN, *Device UINTN, *Function UINTN) → STATUS
-	attributes         uintptr
-	getBarAttributes   uintptr
-	setBarAttributes   uintptr
-	romSize            uint64
-	romImage           uintptr
+	pollMem          uintptr
+	pollIO           uintptr
+	memRead          uintptr
+	memWrite         uintptr
+	ioRead           uintptr
+	ioWrite          uintptr
+	configRead       uintptr // (THIS, Width, Offset UINT32, Count UINTN, Buffer *VOID) → STATUS
+	configWrite      uintptr
+	copyMem          uintptr
+	mapDMA           uintptr
+	unmapDMA         uintptr
+	allocateBuffer   uintptr // (THIS, Type, MemoryType, Pages UINTN, *HostAddress **VOID, Attributes UINT64) → STATUS
+	freeBuffer       uintptr
+	flush            uintptr
+	getLocation      uintptr // (THIS, *Segment UINTN, *Bus UINTN, *Device UINTN, *Function UINTN) → STATUS
+	attributes       uintptr
+	getBarAttributes uintptr
+	setBarAttributes uintptr
+	romSize          uint64
+	romImage         uintptr
 }
 
 // EFI_PCI_IO_PROTOCOL_WIDTH values for configRead/configWrite Width arg.
@@ -71,9 +71,9 @@ const (
 
 // Virtio vendor + supported network device IDs.
 const (
-	virtioVendorID         uint16 = 0x1AF4
-	virtioNetDeviceModern  uint16 = 0x1041 // virtio-net 1.0+ (PCI Vendor-Specific cap)
-	virtioNetDeviceLegacy  uint16 = 0x1000 // virtio-net 0.9.5 transitional
+	virtioVendorID        uint16 = 0x1AF4
+	virtioNetDeviceModern uint16 = 0x1041 // virtio-net 1.0+ (PCI Vendor-Specific cap)
+	virtioNetDeviceLegacy uint16 = 0x1000 // virtio-net 0.9.5 transitional
 )
 
 // pciInit walks every EFI_PCI_IO_PROTOCOL handle, looks for a
@@ -83,10 +83,11 @@ const (
 //
 // Diagnostic markers (CloudBootMark NVRAM variable, readable from
 // the host after the VM stops):
-//   PCI-NONE  — LocateHandleBuffer(PCI_IO) returned 0 handles
-//                → firmware doesn't expose PCI_IO; need raw ECAM
-//   PCI-NONET — handles enumerated but no virtio-net found
-//   PCI-NETOK — virtio-net device located, ready for virtqueue work
+//
+//	PCI-NONE  — LocateHandleBuffer(PCI_IO) returned 0 handles
+//	             → firmware doesn't expose PCI_IO; need raw ECAM
+//	PCI-NONET — handles enumerated but no virtio-net found
+//	PCI-NETOK — virtio-net device located, ready for virtqueue work
 var (
 	pciHandleCount uintptr
 	pciHandleBuf   uintptr

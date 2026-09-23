@@ -70,14 +70,14 @@ const (
 // block. UEFI doesn't expose a typed view; we read 16 bytes from
 // config space then unpack manually.
 type virtioCap struct {
-	capID    uint8
-	capNext  uint8
-	capLen   uint8
-	cfgType  uint8
-	bar      uint8
-	_padA    [3]byte
-	offset   uint32
-	length   uint32
+	capID   uint8
+	capNext uint8
+	capLen  uint8
+	cfgType uint8
+	bar     uint8
+	_padA   [3]byte
+	offset  uint32
+	length  uint32
 }
 
 // vnetCaps holds the four sub-page locations the loader needs. Each
@@ -128,11 +128,11 @@ var (
 // 6-byte truncation as Phase A/B, but unique enough that the prefix
 // disambiguates:
 //
-//   VN-NOCAP  status register reports no capability list — should
-//              never happen on virtio-1.0, would indicate a bus
-//              walk bug or a firmware that hides caps.
-//   VN-NODEV  cap walk completed but no DEVICE_CFG cap found.
-//   VN-MACOK  MAC read succeeded; vnetLocalMAC is valid.
+//	VN-NOCAP  status register reports no capability list — should
+//	           never happen on virtio-1.0, would indicate a bus
+//	           walk bug or a firmware that hides caps.
+//	VN-NODEV  cap walk completed but no DEVICE_CFG cap found.
+//	VN-MACOK  MAC read succeeded; vnetLocalMAC is valid.
 func vnetInit(co *efiSimpleTextOutput) bool {
 	if pciNetIO == nil {
 		return false

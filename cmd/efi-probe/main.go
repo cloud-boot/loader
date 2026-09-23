@@ -148,23 +148,24 @@ type efiHTTPProtocol struct {
 // padding bytes explicit so a structural change shows up as a Go diff
 // rather than a silent firmware fault.
 //
-//   UINT32 HttpVersion          // 0x00 enum: 0=HTTP/1.0, 1=HTTP/1.1
-//   UINT32 TimeOutMillisec      // 0x04
-//   BOOLEAN LocalAddressIsIPv6  // 0x08 (1 byte + 7-byte pad to align ptr)
-//   VOID *AccessPoint           // 0x10 → *efiHTTPv4AccessPoint
+//	UINT32 HttpVersion          // 0x00 enum: 0=HTTP/1.0, 1=HTTP/1.1
+//	UINT32 TimeOutMillisec      // 0x04
+//	BOOLEAN LocalAddressIsIPv6  // 0x08 (1 byte + 7-byte pad to align ptr)
+//	VOID *AccessPoint           // 0x10 → *efiHTTPv4AccessPoint
 type efiHTTPConfigData struct {
-	httpVersion         uint32
-	timeOutMillisec     uint32
-	localAddressIsIPv6  uint8
-	_pad                [7]byte
-	accessPoint         uintptr
+	httpVersion        uint32
+	timeOutMillisec    uint32
+	localAddressIsIPv6 uint8
+	_pad               [7]byte
+	accessPoint        uintptr
 }
 
 // efiHTTPv4AccessPoint:
-//   BOOLEAN UseDefaultAddress  // 0x00 + 3-byte pad
-//   UINT8 LocalAddress[4]      // 0x04
-//   UINT8 LocalSubnet[4]       // 0x08
-//   UINT16 LocalPort           // 0x0C + 2-byte pad
+//
+//	BOOLEAN UseDefaultAddress  // 0x00 + 3-byte pad
+//	UINT8 LocalAddress[4]      // 0x04
+//	UINT8 LocalSubnet[4]       // 0x08
+//	UINT16 LocalPort           // 0x0C + 2-byte pad
 type efiHTTPv4AccessPoint struct {
 	useDefaultAddress uint8
 	_pad              [3]byte
@@ -176,8 +177,9 @@ type efiHTTPv4AccessPoint struct {
 
 // efiHTTPRequestData — passed via efiHTTPMessage.data for outgoing
 // requests:
-//   EFI_HTTP_METHOD Method   // UINT32 enum: 0=GET, 1=POST, 5=HEAD …
-//   CHAR16 *Url              // null-terminated UTF-16 URL
+//
+//	EFI_HTTP_METHOD Method   // UINT32 enum: 0=GET, 1=POST, 5=HEAD …
+//	CHAR16 *Url              // null-terminated UTF-16 URL
 type efiHTTPRequestData struct {
 	method uint32
 	_pad   uint32
@@ -185,27 +187,30 @@ type efiHTTPRequestData struct {
 }
 
 // efiHTTPResponseData — incoming responses:
-//   EFI_HTTP_STATUS_CODE StatusCode  // UINT32 enum
+//
+//	EFI_HTTP_STATUS_CODE StatusCode  // UINT32 enum
 type efiHTTPResponseData struct {
 	statusCode uint32
 }
 
 // efiHTTPHeader:
-//   CHAR8 *FieldName
-//   CHAR8 *FieldValue
+//
+//	CHAR8 *FieldName
+//	CHAR8 *FieldValue
 type efiHTTPHeader struct {
 	fieldName  uintptr
 	fieldValue uintptr
 }
 
 // efiHTTPMessage — message body shared by Request and Response:
-//   union { Request *, Response * } Data  // 8 bytes
-//   UINTN HeaderCount                     // 8 bytes
-//   EFI_HTTP_HEADER *Headers              // 8 bytes
-//   UINTN BodyLength                      // 8 bytes (in/out: caller's
-//                                         // buffer cap on input,
-//                                         // bytes-written on output)
-//   VOID *Body                            // 8 bytes (caller-allocated)
+//
+//	union { Request *, Response * } Data  // 8 bytes
+//	UINTN HeaderCount                     // 8 bytes
+//	EFI_HTTP_HEADER *Headers              // 8 bytes
+//	UINTN BodyLength                      // 8 bytes (in/out: caller's
+//	                                      // buffer cap on input,
+//	                                      // bytes-written on output)
+//	VOID *Body                            // 8 bytes (caller-allocated)
 type efiHTTPMessage struct {
 	data        uintptr // points at request or response struct
 	headerCount uintptr
@@ -215,9 +220,10 @@ type efiHTTPMessage struct {
 }
 
 // efiHTTPToken — the async handshake unit:
-//   EFI_EVENT Event       // 8 bytes (firmware-allocated handle)
-//   EFI_STATUS Status     // 8 bytes
-//   EFI_HTTP_MESSAGE *Msg // 8 bytes
+//
+//	EFI_EVENT Event       // 8 bytes (firmware-allocated handle)
+//	EFI_STATUS Status     // 8 bytes
+//	EFI_HTTP_MESSAGE *Msg // 8 bytes
 type efiHTTPToken struct {
 	event   uintptr
 	status  uintptr // EFI_STATUS is UINTN
@@ -231,8 +237,8 @@ type efiHTTPToken struct {
 // when its policy is explicitly set. OVMF doesn't auto-DHCP for
 // arbitrary EFI apps; we have to do it ourselves.
 type efiIP4Config2Protocol struct {
-	setData    uintptr // 0x00 — EFI_STATUS (*)(this, DataType, DataSize, Data)
-	getData    uintptr // 0x08 — EFI_STATUS (*)(this, DataType, &DataSize, Data)
+	setData              uintptr // 0x00 — EFI_STATUS (*)(this, DataType, DataSize, Data)
+	getData              uintptr // 0x08 — EFI_STATUS (*)(this, DataType, &DataSize, Data)
 	registerDataNotify   uintptr // 0x10
 	unregisterDataNotify uintptr // 0x18
 }
@@ -413,17 +419,17 @@ type efiBlockIOProtocol struct {
 // efiBlockIOMedia — only the fields we read: MediaId (0x00) and
 // LastBlock (0x18) on PE32+/aligned struct layout.
 type efiBlockIOMedia struct {
-	mediaId         uint32  // 0x00
-	removableMedia  uint8   // 0x04
-	mediaPresent    uint8   // 0x05
-	logicalPartition uint8  // 0x06
-	readOnly        uint8   // 0x07
-	writeCaching    uint8   // 0x08
-	_pad            [3]byte // 0x09..0x0B
-	blockSize       uint32  // 0x0C
-	ioAlign         uint32  // 0x10
-	_pad2           uint32  // 0x14
-	lastBlock       uint64  // 0x18
+	mediaId          uint32  // 0x00
+	removableMedia   uint8   // 0x04
+	mediaPresent     uint8   // 0x05
+	logicalPartition uint8   // 0x06
+	readOnly         uint8   // 0x07
+	writeCaching     uint8   // 0x08
+	_pad             [3]byte // 0x09..0x0B
+	blockSize        uint32  // 0x0C
+	ioAlign          uint32  // 0x10
+	_pad2            uint32  // 0x14
+	lastBlock        uint64  // 0x18
 }
 
 // All EFI out-pointers — kept package-scope. Stack-local vars whose

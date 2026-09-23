@@ -35,8 +35,9 @@ var vnetBARPhys uint64
 var vnetMMIOCommon uint64
 
 // CloudBootVNBar — 16 bytes captured for diagnostics:
-//   [0..8]   resolved BAR physical address (LE)
-//   [8..16]  vnetMMIOCommon address (LE) = BAR + common-cfg offset
+//
+//	[0..8]   resolved BAR physical address (LE)
+//	[8..16]  vnetMMIOCommon address (LE) = BAR + common-cfg offset
 var vnetBarVarName = [...]uint16{
 	'C', 'l', 'o', 'u', 'd', 'B', 'o', 'o', 't', 'V', 'N', 'B', 'a', 'r',
 	0,
@@ -59,7 +60,8 @@ var vnetBarVarData [16]byte
 // vnetMMIOCommon. Returns true on success.
 //
 // Marker: VN-BAR  on success
-//         VN-BARFAIL  if BAR read fails or returns 0 (= disabled)
+//
+//	VN-BARFAIL  if BAR read fails or returns 0 (= disabled)
 func vnetResolveBAR(co *efiSimpleTextOutput) bool {
 	if pciNetIO == nil || vnetCommon.length == 0 {
 		return false
@@ -157,8 +159,9 @@ func mmioWriteU32(addr uint64, v uint32) {
 }
 
 // vnetMmioSmokeTest reads device_status (BAR + 20) two ways:
-//   1. Via PCI_IO.Mem.Read (the path we know returns 0x03)
-//   2. Via direct unsafe.Pointer deref at vnetMMIOCommon + 20
+//  1. Via PCI_IO.Mem.Read (the path we know returns 0x03)
+//  2. Via direct unsafe.Pointer deref at vnetMMIOCommon + 20
+//
 // and stamps both into NVRAM. If both return the same value, the
 // MMIO mapping IS accessible from us and the PCI_IO layer isn't
 // adding anything beyond a wrapper. If raw returns garbage (or
@@ -166,8 +169,9 @@ func mmioWriteU32(addr uint64, v uint32) {
 // we'd need a different escape route.
 //
 // CloudBootVNMMIO — 2 bytes:
-//   [0] status via PCI_IO.Mem.Read
-//   [1] status via raw *(*uint8)
+//
+//	[0] status via PCI_IO.Mem.Read
+//	[1] status via raw *(*uint8)
 var vnetMmioVarName = [...]uint16{
 	'C', 'l', 'o', 'u', 'd', 'B', 'o', 'o', 't', 'V', 'N', 'M', 'M', 'I', 'O',
 	0,
@@ -182,8 +186,9 @@ var vnetMmioVarData [2]byte
 // transition and we've cracked it open.
 //
 // CloudBootVNMmioFOK — 2 bytes:
-//   [0] status read via raw MMIO before the write
-//   [1] status read via raw MMIO after the write (after a 10 ms stall)
+//
+//	[0] status read via raw MMIO before the write
+//	[1] status read via raw MMIO after the write (after a 10 ms stall)
 var vnetMmioFokVarName = [...]uint16{
 	'C', 'l', 'o', 'u', 'd', 'B', 'o', 'o', 't', 'V', 'N', 'F', 'o', 'k', 'M',
 	0,

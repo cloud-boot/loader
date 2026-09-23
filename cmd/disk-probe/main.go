@@ -254,9 +254,9 @@ var (
 	// Remember the BlockIO context that produced lastSB so the GDT
 	// follow-up read uses the right handle/media/blksize without
 	// passing parameters through detectFilesystem.
-	lastBIO       uintptr
-	lastMediaId   uint32
-	lastDevBlkSz  uint32
+	lastBIO      uintptr
+	lastMediaId  uint32
+	lastDevBlkSz uint32
 )
 
 // readBlocks calls EFI_BLOCK_IO.ReadBlocks(this, MediaId, LBA, Size, Buffer).
@@ -299,9 +299,9 @@ type ext4SB struct {
 	logGroupsPerFlex uint8  // 0x174 (flex_bg)
 
 	// Derived.
-	blockSize  uint64
-	is64bit    bool
-	totalBlks  uint64
+	blockSize   uint64
+	is64bit     bool
+	totalBlks   uint64
 	totalGroups uint64
 }
 
@@ -444,10 +444,10 @@ const (
 )
 
 type ext4Inode struct {
-	mode       uint16 // 0x00
-	sizeLo     uint32 // 0x04
-	flags      uint32 // 0x20
-	sizeHi     uint32 // 0x6C
+	mode   uint16 // 0x00
+	sizeLo uint32 // 0x04
+	flags  uint32 // 0x20
+	sizeHi uint32 // 0x6C
 	// i_block (60 bytes) starts at offset 0x28 in the raw inode data.
 }
 
@@ -706,7 +706,7 @@ func bytesEqual(a, b []byte) bool {
 func resolvePath(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32,
 	sb *ext4SB, path string,
 ) (uint32, uint8, bool) {
-	cur := uint32(2) // root
+	cur := uint32(2)  // root
 	curFT := uint8(2) // directory
 	i := 0
 	for i < len(path) {
@@ -1009,6 +1009,7 @@ type efiLoadFile2Protocol struct {
 
 // loadFile2Ptr is defined in thunk-arm64.S — returns the runtime
 // address of the asm `loadFile2` entry symbol.
+//
 //go:linkname loadFile2Ptr loadFile2Ptr
 func loadFile2Ptr() uintptr
 
@@ -1219,11 +1220,11 @@ func installInitrdProtocol(co *efiSimpleTextOutput, bs *efiBootServices) bool {
 func chainKernel(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle uintptr, size uint64) {
 	kernelImageHandle = 0
 	st := efiCall6(bs.loadImage,
-		0,                                              // BootPolicy = FALSE
-		imageHandle,                                    // ParentImageHandle
-		0,                                              // DevicePath = NULL
-		kernelBufPtr,                                   // SourceBuffer
-		uintptr(size),                                  // SourceSize
+		0,             // BootPolicy = FALSE
+		imageHandle,   // ParentImageHandle
+		0,             // DevicePath = NULL
+		kernelBufPtr,  // SourceBuffer
+		uintptr(size), // SourceSize
 		uintptr(unsafe.Pointer(&kernelImageHandle)))
 	if st != efiSuccess {
 		writeASCII(co, "    LoadImage failed: ")
@@ -1539,31 +1540,31 @@ func ext4InspectGroupDesc(co *efiSimpleTextOutput, bio uintptr, mediaId, blkSize
 // Format reference: xfs/libxfs/xfs_format.h in the kernel.
 
 type xfsSB struct {
-	magic       uint32 // 0x00 "XFSB" = 0x58465342
-	blockSize   uint32 // 0x04
-	dblocks     uint64 // 0x08  total data blocks
-	rblocks     uint64 // 0x10
-	rextents    uint64 // 0x18
-	uuid        [16]byte
-	logstart    uint64
-	rootIno     uint64 // 0x38  root inode number
-	rbmino      uint64
-	rsumino     uint64
-	rextsize    uint32
-	agblocks    uint32 // 0x54  blocks per AG
-	agcount     uint32 // 0x58  number of AGs
-	rbmblocks   uint32
-	logblocks   uint32
-	versionnum  uint16 // 0x64  v4 = 4 | features; v5 = 5
-	sectsize    uint16
-	inodesize   uint16 // 0x68
-	inopblock   uint16 // 0x6A  inodes per block
+	magic      uint32 // 0x00 "XFSB" = 0x58465342
+	blockSize  uint32 // 0x04
+	dblocks    uint64 // 0x08  total data blocks
+	rblocks    uint64 // 0x10
+	rextents   uint64 // 0x18
+	uuid       [16]byte
+	logstart   uint64
+	rootIno    uint64 // 0x38  root inode number
+	rbmino     uint64
+	rsumino    uint64
+	rextsize   uint32
+	agblocks   uint32 // 0x54  blocks per AG
+	agcount    uint32 // 0x58  number of AGs
+	rbmblocks  uint32
+	logblocks  uint32
+	versionnum uint16 // 0x64  v4 = 4 | features; v5 = 5
+	sectsize   uint16
+	inodesize  uint16 // 0x68
+	inopblock  uint16 // 0x6A  inodes per block
 	// then 12 bytes fsname[12]
-	blocklog    uint8 // 0x78  log2(blockSize)
-	sectlog     uint8
-	inodelog    uint8 // 0x7A  log2(inodesize)
-	inopblog    uint8 // 0x7B  log2(inopblock)
-	agblklog    uint8 // 0x7C  log2(agblocks rounded up)
+	blocklog uint8 // 0x78  log2(blockSize)
+	sectlog  uint8
+	inodelog uint8 // 0x7A  log2(inodesize)
+	inopblog uint8 // 0x7B  log2(inopblock)
+	agblklog uint8 // 0x7C  log2(agblocks rounded up)
 	// rest skipped
 }
 
@@ -1783,9 +1784,9 @@ var (
 // the physical address (and ignore DUP/RAID extras).
 
 const (
-	btrfsKeySize          = 17
-	btrfsChunkItemKey     = 0xE4 // BTRFS_CHUNK_ITEM_KEY
-	btrfsFirstChunkObjID  = 256  // BTRFS_FIRST_CHUNK_TREE_OBJECTID
+	btrfsKeySize         = 17
+	btrfsChunkItemKey    = 0xE4 // BTRFS_CHUNK_ITEM_KEY
+	btrfsFirstChunkObjID = 256  // BTRFS_FIRST_CHUNK_TREE_OBJECTID
 )
 
 type btrfsChunk struct {
@@ -1971,11 +1972,11 @@ const (
 	// Earlier revisions used 0x60/0x61 — those values are for
 	// DIR_LOG_ITEM / DIR_LOG_INDEX (60/72), not the on-disk dir
 	// entries we need to walk.
-	btrfsDirItemKey         = 0x54
-	btrfsDirIndexKey        = 0x60
-	btrfsInodeItemKey       = 0x01
-	btrfsExtentDataKey      = 0x6C
-	btrfsFirstFreeObjectID  = 256
+	btrfsDirItemKey        = 0x54
+	btrfsDirIndexKey       = 0x60
+	btrfsInodeItemKey      = 0x01
+	btrfsExtentDataKey     = 0x6C
+	btrfsFirstFreeObjectID = 256
 )
 
 // findInBtrfsDirPrefix walks an FS_TREE of arbitrary depth for the
@@ -3010,16 +3011,18 @@ func xfsDataForkOffset(version uint8) uint32 {
 // xfsInodeBuf. Returns true on success.
 //
 // XFS inode numbers encode (agno, agbno, offset) bit-shifted:
-//   inopblog       = log2(inopblock)
-//   agblklog       = log2(agblocks rounded up)
-//   agino_log      = inopblog + agblklog
-//   agno           = ino >> agino_log
-//   agino          = ino & ((1<<agino_log) - 1)
-//   agbno          = agino >> inopblog
-//   offsetInBlock  = agino & ((1<<inopblog) - 1)
+//
+//	inopblog       = log2(inopblock)
+//	agblklog       = log2(agblocks rounded up)
+//	agino_log      = inopblog + agblklog
+//	agno           = ino >> agino_log
+//	agino          = ino & ((1<<agino_log) - 1)
+//	agbno          = agino >> inopblog
+//	offsetInBlock  = agino & ((1<<inopblog) - 1)
 //
 // Physical position = agno*agblocks*blockSize + agbno*blockSize +
-//                     offsetInBlock*inodeSize.
+//
+//	offsetInBlock*inodeSize.
 func readXfsInode(co *efiSimpleTextOutput, bio uintptr, mediaId, devBlkSz uint32, sb *xfsSB, inoNum uint64) bool {
 	if sb.inopblock == 0 || sb.blockSize == 0 {
 		return false

@@ -40,12 +40,12 @@ import "unsafe"
 
 // virtio device-status bits.
 const (
-	virtioStatusReset           uint8 = 0
-	virtioStatusAcknowledge     uint8 = 1
-	virtioStatusDriver          uint8 = 2
-	virtioStatusDriverOK        uint8 = 4
-	virtioStatusFeaturesOK      uint8 = 8
-	virtioStatusFailed          uint8 = 128
+	virtioStatusReset            uint8 = 0
+	virtioStatusAcknowledge      uint8 = 1
+	virtioStatusDriver           uint8 = 2
+	virtioStatusDriverOK         uint8 = 4
+	virtioStatusFeaturesOK       uint8 = 8
+	virtioStatusFailed           uint8 = 128
 	virtioStatusDeviceNeedsReset uint8 = 64
 )
 
@@ -72,9 +72,9 @@ const (
 // Feature bits we care about. The virtio spec uses 64-bit feature
 // space — bits 0..31 in feature_select=0, bits 32..63 in =1.
 const (
-	virtioNetFMAC          uint32 = 5  // VIRTIO_NET_F_MAC, low word
-	virtioFVersion1        uint32 = 32 // VIRTIO_F_VERSION_1, high word bit 0
-	virtioFAccessPlatform  uint32 = 33 // VIRTIO_F_ACCESS_PLATFORM (IOMMU), high word bit 1
+	virtioNetFMAC         uint32 = 5  // VIRTIO_NET_F_MAC, low word
+	virtioFVersion1       uint32 = 32 // VIRTIO_F_VERSION_1, high word bit 0
+	virtioFAccessPlatform uint32 = 33 // VIRTIO_F_ACCESS_PLATFORM (IOMMU), high word bit 1
 	// Note: bit 34 in older spec drafts was IOMMU_PLATFORM. The
 	// committed spec name is ACCESS_PLATFORM, bit 33. Apple VZ
 	// offers it as bit 33 (hi=0x5 = bits 32 + 34? no — 0x5 = bits 0+2
@@ -201,11 +201,12 @@ var (
 // true once FEATURES_OK is latched + still set after a re-read.
 //
 // CloudBootMark trail (6-byte truncation in NVRAM):
-//   VN-RST    device reset failed (status read never returned 0)
-//   VN-FEAT-X feature_select round-trip mismatched (firmware bug
-//             or wrong BAR/offset; truncates to "VN-FEA")
-//   VN-FOK    FEATURES_OK accepted by device → ready for queue setup
-//             (truncates to "VN-FOK")
+//
+//	VN-RST    device reset failed (status read never returned 0)
+//	VN-FEAT-X feature_select round-trip mismatched (firmware bug
+//	          or wrong BAR/offset; truncates to "VN-FEA")
+//	VN-FOK    FEATURES_OK accepted by device → ready for queue setup
+//	          (truncates to "VN-FOK")
 func vnetNegotiate(co *efiSimpleTextOutput) bool {
 	if pciNetIO == nil || vnetCommon.length == 0 {
 		return false
@@ -404,10 +405,11 @@ var vnetFeatVarName = [...]uint16{
 var vnetFeatVarData [8]byte
 
 // CloudBootVNStat — 8 bytes capturing FEATURES_OK negotiation state.
-//   [0] status_before  — device_status right before we set FEATURES_OK
-//   [1] status_after   — device_status right after, post 10 ms stall
-//   [2..6] driver_features_lo (4 bytes LE) and ..hi[2] (high word
-//                          low 2 bytes — we don't need bits 48..63)
+//
+//	[0] status_before  — device_status right before we set FEATURES_OK
+//	[1] status_after   — device_status right after, post 10 ms stall
+//	[2..6] driver_features_lo (4 bytes LE) and ..hi[2] (high word
+//	                       low 2 bytes — we don't need bits 48..63)
 var vnetStatusVarName = [...]uint16{
 	'C', 'l', 'o', 'u', 'd', 'B', 'o', 'o', 't', 'V', 'N', 'S', 't', 'a', 't',
 	0,

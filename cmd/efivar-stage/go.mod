@@ -1,13 +1,10 @@
 module github.com/cloud-boot/loader/cmd/efivar-stage
 
-go 1.25.0
+go 1.26.4
 
-require github.com/go-filesystems/uefi v0.0.0
+require github.com/go-filesystems/uefi v0.1.0
 
-require github.com/go-filesystems/interface v0.0.0 // indirect
-
-// Until the mock repo is published on github.com, point at the local
-// checkout. Same pattern as the rest of the cloud-boot repos.
-replace github.com/go-filesystems/uefi => ../../../../../../../dev-temp/GitHub/mock/pkg/go-filesystems/uefi
-
-replace github.com/go-filesystems/interface => ../../../../../../../dev-temp/GitHub/mock/pkg/go-filesystems/interface
+require (
+	github.com/go-filesystems/interface v0.1.0 // indirect
+	github.com/go-volumes/safeio v0.0.0-20260622072324-7f8eb19f6f8c // indirect
+)

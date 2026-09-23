@@ -1,0 +1,80 @@
+name: ci
+
+# What this lane does NOT do, and why, so nobody adds it back in surprise:
+#
+# It does not build the EFI binaries. Those need TinyGo plus a clang/lld-link
+# toolchain driven through the custom targets in targets/*.json, and the thing
+# that proves them is booting eight distro families under QEMU/OVMF and Apple
+# Virtualization -- which is not a GitHub runner. A lane that claimed to
+# "build the loader" by compiling it for the host would be measuring something
+# else and reporting it as the real thing.
+#
+# What it can honestly check is that the Go in here still compiles, is vetted
+# and is formatted. That is not nothing: this repository sat unpublished for
+# ten weeks with a go.mod replace pointing at a /dev-temp scratch directory
+# that does not exist on any machine but one, and nothing said so.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  go:
+    name: build + vet + gofmt
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mod: [efi-loader, disk-probe, efi-probe, efivar-stage]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: cmd/${{ matrix.mod }}/go.mod
+          cache: true
+
+      - name: build
+        working-directory: cmd/${{ matrix.mod }}
+        run: go build ./...
+
+      # ⛔ -unsafeptr=false is deliberate and must stay. These programs map MMIO
+      # and walk firmware tables: converting a uintptr to a pointer IS the job,
+      # and vet's unsafeptr check reports every one of them. Left on, the lane
+      # is red from its first run for doing the thing it exists to do, and a
+      # red lane nobody can fix is a lane people stop reading. Every OTHER vet
+      # check stays on.
+      - name: vet
+        working-directory: cmd/${{ matrix.mod }}
+        run: go vet -unsafeptr=false ./...
+
+      - name: gofmt
+        working-directory: cmd/${{ matrix.mod }}
+        run: |
+          drift=$(gofmt -l .)
+          if [ -n "$drift" ]; then echo "::error::not gofmt-clean:"; echo "$drift"; exit 1; fi
+
+  # The defect that motivated this lane: a replace directive naming a path on
+  # one developer's disk. It cannot be caught by `go build` on that machine --
+  # that is the machine where the path exists.
+  no-local-replaces:
+    name: no go.mod points at a local path
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          set -uo pipefail
+          bad=$(grep -rn '^replace .*=> *\.\./\|^replace .*=> */' cmd/*/go.mod || true)
+          if [ -n "$bad" ]; then
+            echo "::error::a go.mod replaces a module with a filesystem path:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "no filesystem replaces in $(ls cmd/*/go.mod | wc -l) module files"

@@ -120,9 +120,9 @@ type efiRuntimeServices struct {
 	setVirtualAddressMap uintptr
 	convertPointer       uintptr
 
-	getVariable          uintptr // 5 args
-	getNextVariableName  uintptr
-	setVariable          uintptr
+	getVariable         uintptr // 5 args
+	getNextVariableName uintptr
+	setVariable         uintptr
 
 	getNextHighMonotonicCount uintptr
 	resetSystem               uintptr
@@ -624,10 +624,10 @@ func wantsFilePathHandoff() bool {
 // (and OpenBSD/NetBSD images, by removable-media convention) install
 // their bootloader. Called:
 //
-//  - By the FreeBSD cascade in _start after the vendor path
-//    \EFI\freebsd\loader.efi misses on all SFS handles.
-//  - Directly by buildUKIPath() for openbsd/netbsd targets (those
-//    have no vendor-subdir variant to try first).
+//   - By the FreeBSD cascade in _start after the vendor path
+//     \EFI\freebsd\loader.efi misses on all SFS handles.
+//   - Directly by buildUKIPath() for openbsd/netbsd targets (those
+//     have no vendor-subdir variant to try first).
 //
 // Same no-heap pattern as buildUKIPath; arch-agnostic because the
 // filename matches what arm64 firmware looks for at this path.
@@ -1154,11 +1154,11 @@ func tryLoadFromHandle(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle
 		}
 		childImageHandle = 0
 		st = efiCall6(bs.loadImage,
-			0,                                          // BootPolicy=FALSE
-			imageHandle,                                // ParentImageHandle
-			uintptr(unsafe.Pointer(&fileDPBuf[0])),     // DevicePath = our composite
-			0,                                          // SourceBuffer = NULL
-			0,                                          // SourceSize = 0
+			0,                                      // BootPolicy=FALSE
+			imageHandle,                            // ParentImageHandle
+			uintptr(unsafe.Pointer(&fileDPBuf[0])), // DevicePath = our composite
+			0,                                      // SourceBuffer = NULL
+			0,                                      // SourceSize = 0
 			uintptr(unsafe.Pointer(&childImageHandle))) // OUT: ImageHandle
 		if st != efiSuccess {
 			writeASCII(co, "  LoadImage(DevicePath) failed: ")
@@ -1251,12 +1251,12 @@ func tryLoadFromHandle(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle
 	// Step 8: LoadImage from the in-memory buffer.
 	childImageHandle = 0
 	st = efiCall6(bs.loadImage,
-		0,                                            // BootPolicy = FALSE: SourceBuffer holds the image
-		imageHandle,                                  // ParentImageHandle
-		0,                                            // DevicePath = NULL
-		kernelBuffer,                                 // SourceBuffer
-		kernelSize,                                   // SourceSize
-		uintptr(unsafe.Pointer(&childImageHandle)),   // OUT: ImageHandle
+		0,            // BootPolicy = FALSE: SourceBuffer holds the image
+		imageHandle,  // ParentImageHandle
+		0,            // DevicePath = NULL
+		kernelBuffer, // SourceBuffer
+		kernelSize,   // SourceSize
+		uintptr(unsafe.Pointer(&childImageHandle)), // OUT: ImageHandle
 	)
 	if st != efiSuccess {
 		writeASCII(co, "  LoadImage failed: ")

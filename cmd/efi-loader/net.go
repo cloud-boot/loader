@@ -71,25 +71,25 @@ type efiSimpleNetwork struct {
 // callers (DHCP would read PermanentAddress, ReceiveFilterMask drives
 // the .receiveFilters bitmask) don't have to chase offsets.
 type efiSimpleNetworkMode struct {
-	state                uint32 // 0..4
-	hwAddressSize        uint32 // 4..8
-	mediaHeaderSize      uint32 // 8..12
-	maxPacketSize        uint32 // 12..16   (max payload — usually 1500 for Ethernet)
-	nvRamSize            uint32 // 16..20
-	nvRamAccessSize      uint32 // 20..24
-	receiveFilterMask    uint32 // 24..28
-	receiveFilterSetting uint32 // 28..32
-	maxMCastFilterCount  uint32 // 32..36
-	mCastFilterCount     uint32 // 36..40
-	mCastFilter          [16 * 32]byte
-	currentAddress       [32]byte // 552..584 — the active MAC
-	broadcastAddress     [32]byte // 584..616
-	permanentAddress     [32]byte // 616..648
-	ifType               uint8    // 648
-	macAddressChangeable uint8    // 649
-	multipleTxSupported  uint8    // 650
-	mediaPresentSupported uint8   // 651
-	mediaPresent         uint8    // 652
+	state                 uint32 // 0..4
+	hwAddressSize         uint32 // 4..8
+	mediaHeaderSize       uint32 // 8..12
+	maxPacketSize         uint32 // 12..16   (max payload — usually 1500 for Ethernet)
+	nvRamSize             uint32 // 16..20
+	nvRamAccessSize       uint32 // 20..24
+	receiveFilterMask     uint32 // 24..28
+	receiveFilterSetting  uint32 // 28..32
+	maxMCastFilterCount   uint32 // 32..36
+	mCastFilterCount      uint32 // 36..40
+	mCastFilter           [16 * 32]byte
+	currentAddress        [32]byte // 552..584 — the active MAC
+	broadcastAddress      [32]byte // 584..616
+	permanentAddress      [32]byte // 616..648
+	ifType                uint8    // 648
+	macAddressChangeable  uint8    // 649
+	multipleTxSupported   uint8    // 650
+	mediaPresentSupported uint8    // 651
+	mediaPresent          uint8    // 652
 }
 
 // EFI Simple Network states.
@@ -101,11 +101,11 @@ const (
 
 // EFI Simple Network receive-filter bits.
 const (
-	snpFilterUnicast            uint32 = 0x01
-	snpFilterMulticast          uint32 = 0x02
-	snpFilterBroadcast          uint32 = 0x04
-	snpFilterPromiscuous        uint32 = 0x08
-	snpFilterPromiscuousMcast   uint32 = 0x10
+	snpFilterUnicast          uint32 = 0x01
+	snpFilterMulticast        uint32 = 0x02
+	snpFilterBroadcast        uint32 = 0x04
+	snpFilterPromiscuous      uint32 = 0x08
+	snpFilterPromiscuousMcast uint32 = 0x10
 )
 
 // SimpleNetwork instance state. Filled by netInit. Package-scope so

@@ -36,18 +36,18 @@ func be64(b []byte) uint64 {
 const xfsMagic uint32 = 0x58465342 // "XFSB"
 
 type xfsSB struct {
-	magic       uint32
-	blockSize   uint32
-	rootIno     uint64
-	agblocks    uint32
-	agcount     uint32
-	versionnum  uint16
-	inodesize   uint16
-	inopblock   uint16
-	blocklog    uint8
-	inodelog    uint8
-	inopblog    uint8
-	agblklog    uint8
+	magic      uint32
+	blockSize  uint32
+	rootIno    uint64
+	agblocks   uint32
+	agcount    uint32
+	versionnum uint16
+	inodesize  uint16
+	inopblock  uint16
+	blocklog   uint8
+	inodelog   uint8
+	inopblog   uint8
+	agblklog   uint8
 }
 
 func parseXfsSB(data []byte, sb *xfsSB) bool {

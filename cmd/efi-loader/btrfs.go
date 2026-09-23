@@ -746,8 +746,8 @@ var (
 	// inline-extent bytes while the leaf is still loaded. Inline
 	// extents are tiny (≤ sectorsize so usually ≤ 4 KiB) so we just
 	// copy them into a dedicated buffer at gather time.
-	btrfsInlineBuf      [16384]byte
-	btrfsInlineBufUsed  int
+	btrfsInlineBuf     [16384]byte
+	btrfsInlineBufUsed int
 )
 
 // btrfsCollectExtents walks the subvol tree, collecting every

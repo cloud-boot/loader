@@ -55,6 +55,7 @@ type efiLoadFile2Protocol struct {
 
 // loadFile2Ptr is defined in thunk-arm64.S — returns the runtime
 // address of the asm `loadFile2` entry symbol.
+//
 //go:linkname loadFile2Ptr loadFile2Ptr
 func loadFile2Ptr() uintptr
 
@@ -682,12 +683,12 @@ func installInitrdProtocol(co *efiSimpleTextOutput, bs *efiBootServices) bool {
 // the kernel lives in (2 for partition-root, /boot's inode for
 // inside-rootfs); the initrd lookup uses the same directory.
 var (
-	cloudBIO         uintptr
-	cloudMediaId     uint32
-	cloudDevBlkSz    uint32
-	cloudSB          ext4SB
-	cloudFoundExt4   bool
-	cloudKernelDir   uint32 // inode of the directory holding vmlinuz-*
+	cloudBIO       uintptr
+	cloudMediaId   uint32
+	cloudDevBlkSz  uint32
+	cloudSB        ext4SB
+	cloudFoundExt4 bool
+	cloudKernelDir uint32 // inode of the directory holding vmlinuz-*
 )
 
 // tryCloudDiskBoot is the Phase 5d fallback: walk BlockIO handles
@@ -805,10 +806,10 @@ func tryCloudDiskBoot(co *efiSimpleTextOutput, bs *efiBootServices, imageHandle 
 	// existing patchChildCmdline + StartImage path takes over.
 	childImageHandle = 0
 	if efiCall6(bs.loadImage,
-		0,             // BootPolicy = FALSE
-		imageHandle,   // ParentImageHandle
-		0,             // DevicePath = NULL
-		kernelBufPtr,  // SourceBuffer
+		0,            // BootPolicy = FALSE
+		imageHandle,  // ParentImageHandle
+		0,            // DevicePath = NULL
+		kernelBufPtr, // SourceBuffer
 		uintptr(loadedKernelSize),
 		uintptr(unsafe.Pointer(&childImageHandle))) != efiSuccess {
 		writeASCII(co, "  LoadImage(kernel) failed\r\n")

@@ -28,3 +28,16 @@ cloud-overlay.qcow2
 /.freebsd-cache/
 /.netbsd-cache/
 *.qcow2
+
+# Host binaries from `go build ./...` inside a cmd/ module land at
+# cmd/<name>/<name> -- no extension, so no suffix rule catches them, and a rule
+# that NAMES them stops working the day somebody renames a command.
+#
+# So this is a whitelist: ignore everything under cmd/*/ and let the sources
+# back in by extension. If you add a genuinely new kind of source file here,
+# add it below or git will quietly not see it.
+/cmd/*/*
+!/cmd/*/*.go
+!/cmd/*/*.S
+!/cmd/*/go.mod
+!/cmd/*/go.sum
