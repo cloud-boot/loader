@@ -224,10 +224,10 @@ reports the situation honestly on firmware that doesn't.
 
 ## Dependencies
 
-- [`github.com/go-coff/stub`](../../go-coff/stub) — the existing UEFI
+- [`github.com/go-coff/stub`](https://github.com/go-coff/stub) — the existing UEFI
   stub provides the PE walking + LoadImage/StartImage scaffolding we
   build on. Our extensions live in `*.go` files in this directory.
-- [`github.com/go-coff/peln`](../../go-coff/peln) — PE/COFF linker
+- [`github.com/go-coff/peln`](https://github.com/go-coff/peln) — PE/COFF linker
   used by the build pipeline.
 - TinyGo (no GC / no scheduler).
 
@@ -324,7 +324,7 @@ cloud-boot/loader probe — phase 0
 ### Mock package fixes
 
 Getting this working surfaced four real bugs in the host-side
-[`github.com/go-filesystems/uefi`](../../mock/pkg/go-filesystems/uefi)
+[`github.com/go-filesystems/uefi`](https://github.com/go-filesystems/uefi)
 package (which `efivar-stage` uses to write the varstore). All four
 fixes landed in the mock repo alongside Phase 5b:
 
@@ -355,7 +355,7 @@ fixes landed in the mock repo alongside Phase 5b:
    cmdline.
 
 Regression coverage:
-[`format_ovmf_test.go`](../../mock/pkg/go-filesystems/uefi/test/format_ovmf_test.go)
+[`format_ovmf_test.go`](https://github.com/go-filesystems/uefi/blob/main/test/format_ovmf_test.go)
 verifies the wire layout (FV header bytes, GUIDs, FV checksum sums to
 zero, ArmVirt geometry) and round-trips a variable with a non-aligned
 name size — the exact case where the old inter-field-padding code
