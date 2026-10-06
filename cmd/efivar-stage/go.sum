@@ -1,6 +1,6 @@
-github.com/go-filesystems/interface v0.1.0 h1:Rec5051uFN55CTlZyF/3BAqhKB/HGWPKZRqW6Speb+k=
-github.com/go-filesystems/interface v0.1.0/go.mod h1:9MDfHNNKg9cW1qBa3hmURQj4jiWIdTo9Xpgdt8ZzvV8=
-github.com/go-filesystems/uefi v0.1.0 h1:i8rV52ZKtGu7zk2VJHLae39S2vUH4y0Bu97bqE8j+X4=
-github.com/go-filesystems/uefi v0.1.0/go.mod h1:T4WSiZsRTn8KuQixDMRZchs/BIYEBuYU7KhMLkp2r/4=
-github.com/go-volumes/safeio v0.0.0-20260622072324-7f8eb19f6f8c h1:rOwNQiP0VPnyUcRjiVq9QTOCJkN9heon0325hZdFLaQ=
-github.com/go-volumes/safeio v0.0.0-20260622072324-7f8eb19f6f8c/go.mod h1:QQdGwEUmPSdzD+OPq+ZcKso9ljssqgBXNk0/9z7moho=
+github.com/go-filesystems/interface v0.3.0 h1:cV4+2mvW1eCPyde+KIDRaGuIPAcr2sDgKrxGuGQr98k=
+github.com/go-filesystems/interface v0.3.0/go.mod h1:9MDfHNNKg9cW1qBa3hmURQj4jiWIdTo9Xpgdt8ZzvV8=
+github.com/go-filesystems/uefi v0.3.0 h1:R6Njr/2D5LbSqSpQplTs2mErRQsx8YQhaUHkB+5H/80=
+github.com/go-filesystems/uefi v0.3.0/go.mod h1:amDXEO4IU17Me1DAcURgXEqL2JcXE1UqE0baZE4cx8k=
+github.com/go-volumes/safeio v0.0.0-20260831125406-d8f54b2890d4 h1:RKO58FmZvbvKh6wf+7Y8gohGJ0/2hq4N8L+x2kT9bak=
+github.com/go-volumes/safeio v0.0.0-20260831125406-d8f54b2890d4/go.mod h1:QQdGwEUmPSdzD+OPq+ZcKso9ljssqgBXNk0/9z7moho=
